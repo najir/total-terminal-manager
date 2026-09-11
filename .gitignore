@@ -1,0 +1,88 @@
+# ---------------------------------------------------------------
+# ttm — Terminal.Gui v2 (C# / .NET) app
+# Track only source, project files, and docs needed to build.
+# ---------------------------------------------------------------
+
+# Secrets — never commit these.
+.env
+.env.*
+!.env.example
+*.pfx
+*.snk
+appsettings.*.local.json
+secrets.json
+banner.txt
+
+# .NET build output
+bin/
+obj/
+out/
+publish/
+*.dll
+*.exe
+*.pdb
+*.nupkg
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+BenchmarkDotNet.Artifacts/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+*~
+.history/
+.ionide/
+
+# AI assistant files
+.claude/
+.aider*
+.cursorrules
+.cursor/
+.windsurfrules
+.windsurf/
+.codeium/
+.continue/
+.copilot/
+.github/copilot-instructions.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.gemini/
+.roo/
+.roomodes
+.clinerules
+.cline/
+.trae/
+.kilocode/
+
+# Backups / archives / scratch
+.backup/
+_archive/
+_tmp/
+*.bak
+*.backup
+*.orig
+*.tmp
+*.old
+*.log
+
+# OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
