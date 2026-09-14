@@ -223,9 +223,15 @@ internal static class UserSettings
 
     public const string NotesFolderName = "notes";
 
+    public const string DailyFolderName = "daily";
+
     public const string ProjectsFolderName = "projects";
 
     public const string DatabaseFolderName = "database";
+
+    // Where Download copies the folder before it overwrites it. Git-ignored, so a later
+    // clean -fd never removes the safety net it just made.
+    public const string BackupFolderName = "_backup";
 
     public const string EmailProvider = "email-provider";
 
@@ -253,6 +259,16 @@ internal static class UserSettings
     public const string Codeberg = "codeberg";
 
     public static readonly string[] GitProviders = { GitHub, Codeberg };
+
+    // Data sync (datasync.cs). The remote may be https, http, ssh or a local/UNC path; the
+    // username and token are NOT here - they live encrypted in AuthStore, keyed by host.
+    public const string SyncRemote = "sync-remote";
+
+    public const string SyncBranch = "sync-branch";
+
+    // Only consulted for an https remote whose certificate does not chain to a trusted root,
+    // which is the normal case for a self-hosted git service.
+    public const string SyncInsecureTls = "sync-insecure-tls";
 
     public const string ShowTeams = "show-teams";
 
@@ -285,6 +301,10 @@ internal static class UserSettings
 
         [GitProvider] = GitHub,
 
+        [SyncRemote] = "",
+        [SyncBranch] = "main",
+        [SyncInsecureTls] = "false",
+
         [FileRoots] = new JsonArray (
                                      (JsonNode) @"%USERPROFILE%\.claude",
                                      (JsonNode) $@"%APPDATA%\{FolderName}",
@@ -311,9 +331,13 @@ internal static class UserSettings
 
     public static string NotesPath => Path.Combine (FolderPath, NotesFolderName);
 
+    public static string DailyPath => Path.Combine (NotesPath, DailyFolderName);
+
     public static string ProjectsPath => Path.Combine (FolderPath, ProjectsFolderName);
 
     public static string DatabasePath => Path.Combine (FolderPath, DatabaseFolderName);
+
+    public static string BackupPath => Path.Combine (FolderPath, BackupFolderName);
 
     public static void Load ()
     {
@@ -327,6 +351,7 @@ internal static class UserSettings
             Directory.CreateDirectory (ReviewsPath);
 
             Directory.CreateDirectory (NotesPath);
+            Directory.CreateDirectory (DailyPath);
             Directory.CreateDirectory (ProjectsPath);
             Directory.CreateDirectory (DatabasePath);
 

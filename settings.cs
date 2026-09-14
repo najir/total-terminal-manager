@@ -8,7 +8,7 @@ using System.Text.Json;
 internal static class Settings
 {
     public static List<View> Pages (Pos x, Pos y) =>
-        new () { new ThemePage (x, y), new PreferencesPage (x, y) };
+        new () { new ThemePage (x, y), new PreferencesPage (x, y), new UserPage (x, y) };
 
     public static IEnumerable<MenuItem> MenuItems (List<View> all, IEnumerable<View> pages) =>
         pages.Select (
@@ -22,6 +22,22 @@ internal static class Settings
                                        page.SetFocus();
                                    }
                       });
+
+    /// <summary>A checkbox bound straight to a boolean user setting. Shared by the pages below.</summary>
+    public static CheckBox Toggle (string text, string key, Pos x, Pos y)
+    {
+        CheckBox box = new ()
+        {
+            Text = text,
+            X = x,
+            Y = y,
+            Value = UserSettings.On (key) ? CheckState.Checked : CheckState.UnChecked
+        };
+
+        box.ValueChanged += (_, e) => UserSettings.Set (key, e.NewValue == CheckState.Checked);
+
+        return box;
+    }
 }
 
 /// <summary>Pick a theme. Enter on a row applies it to the whole app at once.</summary>
@@ -94,8 +110,8 @@ internal sealed class PreferencesPage : Window
 
         Label widgetsLabel = new () { Text = "Dashboard widgets", X = 0, Y = Pos.Bottom (email) + 1 };
 
-        CheckBox teams = Toggle ("_Teams", UserSettings.ShowTeams, 0, Pos.Bottom (widgetsLabel));
-        CheckBox mail = Toggle ("_Mail", UserSettings.ShowMail, 0, Pos.Bottom (teams));
+        CheckBox teams = Settings.Toggle ("_Teams", UserSettings.ShowTeams, 0, Pos.Bottom (widgetsLabel));
+        CheckBox mail = Settings.Toggle ("_Mail", UserSettings.ShowMail, 0, Pos.Bottom (teams));
 
         Label aiLabel = new () { Text = "AI default backend", X = 0, Y = Pos.Bottom (mail) + 1 };
 
@@ -251,21 +267,6 @@ internal sealed class PreferencesPage : Window
              linksLabel, linkList, nameLabel, linkName, urlLabel, linkUrl, addLink, removeLink, path);
     }
 
-    private static CheckBox Toggle (string text, string key, Pos x, Pos y)
-    {
-        CheckBox box = new ()
-        {
-            Text = text,
-            X = x,
-            Y = y,
-            Value = UserSettings.On (key) ? CheckState.Checked : CheckState.UnChecked
-        };
-
-        box.ValueChanged += (_, e) => UserSettings.Set (key, e.NewValue == CheckState.Checked);
-
-        return box;
-    }
-
     private void EditSettingsFile ()
     {
         string path = UserSettings.FilePath;
@@ -330,3 +331,197 @@ internal sealed class PreferencesPage : Window
     }
 }
 
+/// <summary>
+///     Everything tied to this user rather than to the app: where their data syncs to, and the
+///     credentials that get them there. Kept off the Preferences page because a credential is not
+///     a preference - it is a secret with its own passphrase and its own destruction rules.
+/// </summary>
+internal sealed class UserPage : Window
+{
+    public UserPage (Pos x, Pos y)
+    {
+        Title = "User";
+        X = x;
+        Y = y;
+        Width = Dim.Fill ();
+        Height = Dim.Fill ();
+
+        Label syncLabel = new () { Text = "Data sync (total-manager folder)", X = 0, Y = 0 };
+
+        Label syncRemoteLabel = new () { Text = "Repo", X = 0, Y = Pos.Bottom (syncLabel) };
+
+        TextField syncRemote = new ()
+        {
+            X = 8,
+            Y = Pos.Top (syncRemoteLabel),
+            Width = 52,
+            Text = UserSettings.Get (UserSettings.SyncRemote)
+        };
+
+        Button apply = new () { Text = "App_ly", X = Pos.Right (syncRemote) + 2, Y = Pos.Top (syncRemoteLabel) };
+
+        Label syncBranchLabel = new () { Text = "Branch", X = 0, Y = Pos.Bottom (syncRemoteLabel) };
+
+        TextField syncBranch = new ()
+        {
+            X = 8,
+            Y = Pos.Top (syncBranchLabel),
+            Width = 20,
+            Text = UserSettings.Get (UserSettings.SyncBranch)
+        };
+
+        CheckBox insecure = Settings.Toggle (
+                                             "Allow self-_signed certificate",
+                                             UserSettings.SyncInsecureTls,
+                                             Pos.Right (syncBranch) + 2,
+                                             Pos.Top (syncBranchLabel));
+
+        // Says out loud how the remote will be reached, because that decides whether a token is
+        // asked for at all - ssh and a local path never are.
+        Label syncKind = new () { X = 0, Y = Pos.Bottom (syncBranchLabel), Width = Dim.Fill (), Height = 1 };
+
+        Button download = new () { Text = "_Download", X = 0, Y = Pos.Bottom (syncKind) };
+        Button update = new () { Text = "_Update", X = Pos.Right (download) + 1, Y = Pos.Top (download) };
+
+        // Set by Apply, cleared as soon as the box is edited again.
+        string note = "";
+
+        void ShowRemote ()
+        {
+            SyncRemote typed = SyncRemote.Parse (syncRemote.Text);
+
+            bool pending = typed.Url != UserSettings.Get (UserSettings.SyncRemote);
+
+            syncKind.Text = "  "
+                            + typed.Describe ()
+                            + (pending ? "   [ press Apply to use this ]" : note);
+        }
+
+        // Applying is deliberate rather than per keystroke. The URL is the one field here that can
+        // carry a secret, and committing it on every character meant rewriting the settings file
+        // per character and capturing half-typed tokens.
+        void Apply ()
+        {
+            SyncRemote parsed = SyncRemote.Parse (syncRemote.Text);
+
+            // A pasted https://user:token@host URL is the form most git guides show, and the one
+            // that must not be kept: this settings file is itself inside the synced folder, so the
+            // token would be pushed to the remote. Keep the token, save the URL without it.
+            GitCredential? carried = GitCredential.InUrl (syncRemote.Text);
+
+            // Only ever adds. Applying twice - which pressing Download does - must not drop what
+            // the first pass captured, and by then the box holds the sanitised URL with no token
+            // left in it to find.
+            if (carried is not null)
+            {
+                PendingCredential.Capture (parsed.AuthId, carried);
+            }
+
+            UserSettings.Set (UserSettings.SyncRemote, parsed.Url);
+
+            // Show what was actually saved, so a token leaving the box is visibly deliberate.
+            // This fires TextChanged, which clears the note - so set the note after it, not before.
+            syncRemote.Text = parsed.Url;
+
+            note = carried is null ? "" : "   (token taken from the link - encrypted on the next sync)";
+
+            ShowRemote ();
+        }
+
+        syncRemote.TextChanged += (_, _) =>
+        {
+            note = "";
+            ShowRemote ();
+        };
+
+        apply.Accepted += (_, _) => Apply ();
+        syncRemote.Accepted += (_, _) => Apply ();
+
+        ShowRemote ();
+
+        syncBranch.TextChanged += (_, _) => UserSettings.Set (UserSettings.SyncBranch, syncBranch.Text.Trim ());
+
+        // Applies first, so what is on screen is always what runs - an unapplied edit can never
+        // silently sync the previous remote.
+        download.Accepted += (_, _) =>
+        {
+            Apply ();
+            SyncRunner.Download (this);
+        };
+
+        update.Accepted += (_, _) =>
+        {
+            Apply ();
+            SyncRunner.Update (this);
+        };
+
+        // Separate from the sync group above: the passphrase guards every stored credential, not
+        // only the git ones, and will cover whatever else the app needs to hold later.
+        Label credentialsLabel = new () { Text = "Stored credentials", X = 0, Y = Pos.Bottom (download) + 1 };
+
+        Label credentialsValue = new () { X = 0, Y = Pos.Bottom (credentialsLabel), Width = Dim.Fill (), Height = 1 };
+
+        Button passphrase = new () { Text = "Set _passphrase", X = 0, Y = Pos.Bottom (credentialsValue) };
+        Button forget = new () { Text = "For_get all", X = Pos.Right (passphrase) + 1, Y = Pos.Top (passphrase) };
+
+        void ShowCredentials ()
+        {
+            string[] ids = AuthStore.Ids ();
+
+            credentialsValue.Text = "  "
+                                    + (ids.Length == 0
+                                           ? AuthStore.HasPassphrase
+                                                 ? "none stored - you are asked for a token the first time one is needed"
+                                                 : "no passphrase set yet - the first sync will ask for one"
+                                           : string.Join ("  ", ids));
+
+            forget.Enabled = ids.Length > 0;
+        }
+
+        ShowCredentials ();
+
+        passphrase.Accepted += (_, _) =>
+        {
+            AuthPrompt.Manage (this);
+            ShowCredentials ();
+        };
+
+        forget.Accepted += (_, _) =>
+        {
+            int stored = AuthStore.Count;
+
+            int? choice = MessageBox.Query (
+                                            App!,
+                                            "Forget stored credentials",
+                                            $"Delete all {stored} stored credential(s)?"
+                                            + Environment.NewLine
+                                            + Environment.NewLine
+                                            + "The passphrase is kept. You will be asked for each token"
+                                            + Environment.NewLine
+                                            + "again the next time it is needed."
+                                            + Environment.NewLine
+                                            + Environment.NewLine
+                                            + "This cannot be undone.",
+                                            new [] { "_Cancel", "_Delete" });
+
+            if (choice == 1)
+            {
+                AuthStore.ClearAll ();
+                ShowCredentials ();
+            }
+        };
+
+        // Named explicitly, and worth reading: this path is deliberately outside the folder the
+        // sync replicates, so a credential is never pushed to the remote.
+        Label path = new ()
+        {
+            Text = $"Kept out of the synced folder, in {AuthStore.FilePath}",
+            X = 0,
+            Y = Pos.Bottom (passphrase) + 1
+        };
+
+        Add (syncLabel, syncRemoteLabel, syncRemote, apply,
+             syncBranchLabel, syncBranch, insecure, syncKind, download, update,
+             credentialsLabel, credentialsValue, passphrase, forget, path);
+    }
+}

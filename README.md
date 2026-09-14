@@ -75,11 +75,14 @@ dotnet run
 | `utility.cs` | 2281 | Shared services: `Env`, `GraphAuth`, `GmailAuth`, `UserSettings`, `AutoRefresh`, `ApiCache`, `ChatProvider`, `ContextPolicy`, `RetryingChatClient`, and the AI tool sets (`TerminalTools`, `FileTools`, `MathTools`, `TranscriptTools`). |
 | `ViewHandler.cs` | 416 | View helpers: visibility switching, `Dim.Auto` re-measure, wheel scrolling, `ScrollableView`, collapse toggle, TableView selection/wheel tweaks. |
 | `layouts.cs` | 168 | `Layouts.Horizontal` / `Layouts.Vertical` containers that equalise widgets across the other axis. |
-| `settings.cs` | 332 | Theme page and Preferences page plus their menu items. |
+| `settings.cs` | 447 | Theme, Preferences and User pages plus their menu items. |
 | `theme.cs` | 175 | Runtime theme JSON (custom themes), apply and restore of the saved theme. |
 | `editorkeys.cs` | 230 | VS Code-style line editing for `Editor` (see [Editor keys](#editor-keys)). |
 | `scripts.cs` | 61 | The Scripts tab window. |
 | `constants.cs` | 23 | `notes` table name and column definitions. |
+| `auth.cs` | 351 | `AuthStore`: credentials encrypted under one passphrase (PBKDF2 -> HKDF -> AES-GCM). No UI dependency. |
+| `authui.cs` | 308 | `AuthPrompt`: the passphrase and credential dialogs. |
+| `datasync.cs` | 780 | `SyncRemote`, `DataSync`, `SyncRunner`: git-backed replication of the app data folder. |
 | `ttm.csproj` | | Project file. Excludes `_archive/**` and `.backup/**` from compilation. |
 | `global.json` | | Pins .NET SDK 10.0.100 with `latestMajor` roll-forward. |
 | `.editorconfig` | | UTF-8, 4-space C#, 2-space JSON/MD/csproj. |
@@ -173,6 +176,9 @@ Rules: a value already in the real environment wins over `.env`; blank values ar
 | `ai-provider`, `ai-url`, `ai-model` | | AI tab defaults. Avoid. |
 | `ai-compact-tokens`, `ai-trim-tokens` | 120000 / 200000 | Chat context compaction thresholds. Avoid. |
 | `next-up-model` | `""` | Reserved for the Next Up widget. |
+| `sync-remote` | `""` | Data sync remote. `https`/`http` URL, `ssh` URL or scp form, or a local/UNC path. |
+| `sync-branch` | `main` | Branch the sync pushes to and pulls from. |
+| `sync-insecure-tls` | `false` | Skip certificate validation for the sync host only. For a self-hosted service with a self-signed certificate. |
 
 ### App data folder (`%APPDATA%\total-manager\`)
 
@@ -188,6 +194,95 @@ Rules: a value already in the real environment wins over `.env`; blank values ar
 | `skills\` | `.md` skill files (AI tab). |
 | `projects\` | Project documents for the Projects widget. |
 | `cache\` | `ApiCache` responses. |
+| `_backup\<timestamp>\` | Copy of the folder taken before a sync Download overwrites it. Git-ignored. |
+| `.git\`, `.gitignore`, `.gitattributes` | Created by the data sync. Only present once a sync has run. |
+
+---
+
+## Data sync (`datasync.cs`, `auth.cs`, `authui.cs`)
+
+Lives on its own **Settings > User** page - a credential is not a preference.
+
+Replicates `%APPDATA%\total-manager\` between machines through a git remote. Enter the repo URL
+in **Settings > User** and press **Apply** (or Enter in the box), then press **Download** or
+**Update**. Pressing either applies a pending edit first, so what is on screen is always what runs.
+
+Neither direction merges:
+
+| Button | Effect |
+|---|---|
+| **Download** | The folder is made to match the remote. `fetch` + `reset --hard` + `clean -fd`. Local changes the remote does not have are discarded. |
+| **Update** | The remote is made to match the folder. `add -A` + `commit` + `push --force`. Commits only on the remote are lost. |
+
+Both confirm first, naming the remote and branch. Download copies the folder to
+`_backup\<timestamp>\` before touching anything.
+
+Excluded from the sync: `cache\`, `_backup\`, and the SQLite `-wal`/`-shm` sidecars. The database
+itself **is** synced, so Research links travel with the notes; the write-ahead log is checkpointed
+into the file before it is committed, and the data layers are reopened afterwards. Tabs already
+open still show pre-download data, so restart after a Download.
+
+`.gitattributes` is pinned to `* -text` and `core.autocrlf` to `false`, so a Windows/Linux round
+trip never rewrites line endings.
+
+### Remotes and sign-in
+
+The remote form decides whether a credential is needed:
+
+| Form | Example | Sign-in |
+|---|---|---|
+| `https` | `https://github.com/me/ttm-data.git` | Username + access token |
+| `http` | `http://git.lan:3000/me/ttm.git` | Username + access token, sent unencrypted |
+| `ssh` | `git@git.lan:me/ttm.git` | Your existing keys and agent. Never prompts. |
+| local / UNC | `D:\repos\ttm.git`, `\\server\share\ttm.git` | None. Never prompts. |
+
+One HTTP Basic path covers GitHub, Codeberg, Forgejo, Gitea, GitLab and Bitbucket, so a
+self-hosted service needs no special handling beyond its username. For an https host whose
+certificate does not chain to a trusted root, tick **Allow self-signed certificate**; it is scoped
+to that one host.
+
+The token is injected as a host-scoped `http.<origin>.extraHeader` through the git child
+environment. It never reaches the command line, and it is never written into `.git/config`.
+
+### Credential storage
+
+There is no token field on the User page. The first sync that needs one asks for a
+passphrase, then for the username and token, then confirms and runs. After that the token comes
+from the store; only the passphrase is asked for again.
+
+If you paste a repo URL with the credential embedded - `https://user:token@host/repo.git`, the
+form most git guides show - **Apply** takes the token out of the URL and keeps it for the next
+sync, which encrypts it into the store. You are not asked to type it again, and the token visibly
+disappears from the box so you can see that it happened.
+
+What gets written to `user-settings.json` is the URL without it, which matters because that file is
+itself inside the synced folder: left in place, the token would be pushed to the remote in
+plaintext on the next Update. The captured token is held in memory only and does not survive a
+restart - paste it again, or answer the prompt.
+
+The repo URL is the one field in the app with an Apply button. Every other setting writes through on
+change, but this field can carry a secret, and committing it per keystroke meant rewriting the
+settings file on every character and capturing half-typed tokens.
+
+Credentials live in `%LOCALAPPDATA%\total-manager\credentials.json` (`~/.local/share/` on Linux)
+— deliberately **outside** the synced folder, so a token can never be committed and pushed.
+
+The passphrase is stretched with PBKDF2-SHA256 (600k iterations, random salt) and split with HKDF
+into a *verifier* that is stored and compared whenever the passphrase is typed, and an *encryption
+key* that is never stored. Entries are AES-256-GCM, keyed by a namespaced id (`git:github.com`),
+so the store is not git-specific and one passphrase covers every credential the app ever holds.
+
+The passphrase is asked for on each action that needs it and is never cached between actions.
+
+At the foot of **Settings > User**:
+
+- **Set passphrase** — first run sets one; afterwards it changes one. Changing it with the current
+  passphrase re-encrypts every stored credential and keeps them. **Forgot it** skips that check and
+  destroys them all, because without the old passphrase nothing can read them.
+- **Forget all** — deletes every stored credential, keeping the passphrase.
+
+A mismatched passphrase retries rather than wiping anything; destroying credentials is only ever
+reached through an explicit confirm.
 
 ---
 

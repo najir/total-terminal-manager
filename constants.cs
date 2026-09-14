@@ -19,5 +19,17 @@ internal static class Constants
     };
 
     public static readonly string[] NotesReservedColumns = { "filepath", "title", "content", "deleted" };
+
+    public const string ResearchTable = "research";
+
+    // The creation date is the database's own, in local time, so a row is dated by the write that
+    // made it - the Research page stores a name and a url and nothing else.
+    public static readonly OrderedDictionary<string, string> ResearchColumns = new (StringComparer.OrdinalIgnoreCase)
+    {
+        ["id"] = "INTEGER PRIMARY KEY AUTOINCREMENT",
+        ["name"] = "TEXT NOT NULL DEFAULT ''",
+        ["url"] = "TEXT NOT NULL DEFAULT ''",
+        ["created"] = "TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))"
+    };
 }
 

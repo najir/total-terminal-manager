@@ -11,9 +11,11 @@ internal static class Engine
 {
     public const string FileName = "total-manager.db";
 
-    private const int TargetSchemaVersion = 5;
+    private const int TargetSchemaVersion = 6;
 
     private static readonly string CreateNotes = CreateTable (Constants.NotesTable, Constants.NotesColumns);
+
+    private static readonly string CreateResearch = CreateTable (Constants.ResearchTable, Constants.ResearchColumns);
 
     private static string CreateTable (string table, OrderedDictionary<string, string> columns) =>
         $"CREATE TABLE IF NOT EXISTS {table} ("
@@ -134,6 +136,11 @@ internal static class Engine
         if (version < 5 && !HasColumn (connection, transaction, Constants.NotesTable, "deleted"))
         {
             Execute (connection, transaction, AddDeleted);
+        }
+
+        if (version < 6)
+        {
+            Execute (connection, transaction, CreateResearch);
         }
 
         Execute (connection, transaction, $"PRAGMA user_version = {TargetSchemaVersion};");

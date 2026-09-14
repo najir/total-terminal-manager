@@ -28,7 +28,7 @@ internal static class Notes
     }
 
     public static List<View> Pages (Pos x, Pos y) =>
-        new () { new EditorPage (x, y), new DocumentsPage (x, y) };
+        new () { new EditorPage (x, y), new DocumentsPage (x, y), new ResearchPage (x, y) };
 
     public static IEnumerable<MenuItem> MenuItems (List<View> all, IEnumerable<View> pages) =>
         pages.Select (
@@ -104,11 +104,12 @@ internal sealed class EditorPage : Window
         Button save = new () { Text = "_Save", X = Pos.Right (open) + 1, Y = 0 };
         Button saveAs = new () { Text = "Save _As", X = Pos.Right (save) + 1, Y = 0 };
         Button colour = new () { Text = "_Background", X = Pos.Right (saveAs) + 1, Y = 0 };
+        Button daily = new () { Text = "_Daily", X = Pos.Right (colour) + 1, Y = 0 };
 
         _pathLabel = new ()
         {
             Text = Unsaved,
-            X = Pos.Right (colour) + 2,
+            X = Pos.Right (daily) + 2,
             Y = 0,
             Width = Dim.Fill (SavedWidth + 1),
             Height = 1
@@ -171,6 +172,8 @@ internal sealed class EditorPage : Window
 
         colour.Accepted += (_, _) => PickBackground ();
 
+        daily.Accepted += (_, _) => OpenDaily ();
+
         AddCommand (Command.Save, () => { Save (); return true; });
         KeyBindings.Add (Key.S.WithCtrl, Command.Save);
 
@@ -183,7 +186,44 @@ internal sealed class EditorPage : Window
                                }
                            };
 
-        Add (create, open, save, saveAs, colour, _pathLabel, _savedLabel, _editor);
+        Add (create, open, save, saveAs, colour, daily, _pathLabel, _savedLabel, _editor);
+    }
+
+    /// <summary>
+    ///     Opens today's daily note - one file a day, named for the date, in the daily folder
+    ///     under the notes folder. The first press of the day writes the file, so it is saved
+    ///     and listed on the Documents page before a word is typed; later presses reopen it.
+    /// </summary>
+    private void OpenDaily ()
+    {
+        string path = Path.Combine (UserSettings.DailyPath, $"{DateTime.Now:dd-MM-yyyy}-daily{DefaultType}");
+
+        if (File.Exists (path))
+        {
+            Open (path);
+            _editor.SetFocus ();
+
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory (UserSettings.DailyPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            MessageBox.ErrorQuery (App!, "Cannot create folder", UserSettings.DailyPath + Environment.NewLine + ex.Message, new [] { "_Ok" });
+
+            return;
+        }
+
+        _editor.Text = "";
+        _path = path;
+
+        // Save writes the file and records it in the notes database, the same as any other note.
+        Save ();
+
+        _editor.SetFocus ();
     }
 
     private void Save (bool askPath = false)
