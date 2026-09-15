@@ -219,7 +219,78 @@ internal sealed class TasksWidget : View
                                       "",
                                       description);
 
-        MessageBox.Query (App!, "Task", details, new [] { "_Ok" });
+        int? choice = MessageBox.Query (App!, "Task", details, new [] { "_Edit", "_Ok" });
+
+        if (choice == 0)
+        {
+            Edit (row);
+        }
+    }
+
+    /// <summary>Edit the name and the description of one task, in place.</summary>
+    private void Edit (int row)
+    {
+        TaskItem task = _tasks [row];
+
+        Dialog dialog = new ()
+        {
+            Title = "Edit task",
+            Width = Dim.Percent (70),
+            Height = Dim.Percent (60)
+        };
+
+        Label nameLabel = new () { Text = "Name", X = 0, Y = 0 };
+
+        TextField name = new ()
+        {
+            X = 0,
+            Y = Pos.Bottom (nameLabel),
+            Width = Dim.Fill (),
+            Text = task.Name
+        };
+
+        Label descriptionLabel = new () { Text = "Description", X = 0, Y = Pos.Bottom (name) + 1 };
+
+        Editor description = new ()
+        {
+            X = 0,
+            Y = Pos.Bottom (descriptionLabel),
+            Width = Dim.Fill (),
+            Height = Dim.Fill (),
+            Text = task.Description
+        };
+
+        Button cancel = new () { Text = "_Cancel" };
+        Button save = new () { Text = "_Save" };
+
+        cancel.Accepted += (_, _) => App!.RequestStop (dialog);
+
+        save.Accepted += (_, _) =>
+        {
+            string edited = name.Text.Trim ();
+
+            if (edited.Length == 0)
+            {
+                MessageBox.ErrorQuery (App!, "Edit task", "name is required", new [] { "_Ok" });
+
+                return;
+            }
+
+            task.Name = edited;
+            task.Description = description.Text.Trim ();
+
+            App!.RequestStop (dialog);
+
+            Commit ();
+        };
+
+        dialog.AddButton (cancel);
+        dialog.AddButton (save);
+
+        dialog.Add (nameLabel, name, descriptionLabel, description);
+
+        App!.Run (dialog);
+        dialog.Dispose ();
     }
 
     private void Delete (int row)

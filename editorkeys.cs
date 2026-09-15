@@ -1,5 +1,6 @@
 // -----------------------------------------------------------------------------
-//  VS Code-style line editing for Editor: cut, copy, paste, delete and insert lines.
+//  VS Code-style line editing for Editor: cut, copy, paste, delete and insert lines,
+//  plus word-border movement for Ctrl(+Shift)+Right.
 // -----------------------------------------------------------------------------
 
 using Terminal.Gui.Editor.Document;
@@ -13,18 +14,35 @@ internal static class EditorKeys
 
     private static readonly Key LineAbove = Key.Enter.WithCtrl.WithShift;
 
+    private static readonly Key WordRight = Key.CursorRight.WithCtrl;
+
+    private static readonly Key SelectWordRight = Key.CursorRight.WithCtrl.WithShift;
+
     public static void AddEditingKeys (this Editor editor)
     {
         string? lineClip = null;
 
         editor.KeyDown += (_, key) =>
         {
-            if (key.Handled || !editor.Multiline || editor.HasMultipleCarets)
+            if (key.Handled || editor.HasMultipleCarets)
             {
                 return;
             }
 
             TextDocument doc = editor.Document!;
+
+            if (key == WordRight || key == SelectWordRight)
+            {
+                MoveWordRight (editor, doc, extend: key == SelectWordRight);
+                key.Handled = true;
+
+                return;
+            }
+
+            if (!editor.Multiline)
+            {
+                return;
+            }
 
             if (key == Key.C.WithCtrl)
             {
@@ -60,7 +78,11 @@ internal static class EditorKeys
             }
             else if (key == Key.V.WithCtrl)
             {
-                key.Handled = PasteLine (editor, doc, lineClip);
+                if (lineClip is { } clip && !editor.HasSelection && StillClipped (editor, clip))
+                {
+                    PasteLine (editor, doc, clip);
+                    key.Handled = true;
+                }
             }
             else if (key == DeleteLine)
             {
@@ -78,6 +100,47 @@ internal static class EditorKeys
                 key.Handled = true;
             }
         };
+    }
+
+    /// <summary>
+    ///     The next word border at or after <paramref name="caret" />. The Editor's own Ctrl+Right uses
+    ///     <see cref="CaretPositioningMode.WordStartOrSymbol" />, which has no stop at the end of a word, so
+    ///     moving right off a word runs through the trailing whitespace and lands on the next word's first
+    ///     character &#8212; selecting that whitespace along with the word. Word borders stop at both ends.
+    /// </summary>
+    private static int WordBorderRight (TextDocument doc, int caret)
+    {
+        int next = TextUtilities.GetNextCaretPosition (doc, caret, LogicalDirection.Forward, CaretPositioningMode.WordBorderOrSymbol);
+
+        return next < 0 ? doc.TextLength : Math.Min (next, doc.TextLength);
+    }
+
+    private static void MoveWordRight (Editor editor, TextDocument doc, bool extend)
+    {
+        int target = WordBorderRight (doc, editor.CaretOffset);
+
+        if (!extend)
+        {
+            editor.ClearSelection ();
+            editor.CaretOffset = target;
+
+            return;
+        }
+
+        // RightExtend keeps the selection anchored where the user started, which a SelectRange built
+        // from the current offsets cannot do once the selection runs backwards from the anchor. It
+        // advances one grapheme cluster per call, so step until the caret reaches the border.
+        while (editor.CaretOffset < target)
+        {
+            int before = editor.CaretOffset;
+
+            editor.InvokeCommand (Command.RightExtend);
+
+            if (editor.CaretOffset <= before)
+            {
+                break;
+            }
+        }
     }
 
     /// <summary>The lines a line-wise command acts on: the caret line, or every line the selection touches.</summary>
@@ -173,17 +236,21 @@ internal static class EditorKeys
         editor.CaretOffset = landing.Offset + Math.Min (Math.Max (column - 1, 0), landing.Length);
     }
 
-    private static bool PasteLine (Editor editor, TextDocument doc, string? lineClip)
+    /// <summary>
+    ///     True while the line clip is still what a paste would deliver. Bodies are compared because the
+    ///     OS round-trip does not return the trailing delimiter byte-identically. An unreadable clipboard
+    ///     leaves the clip as the source of truth.
+    /// </summary>
+    private static bool StillClipped (Editor editor, string lineClip)
     {
-        if (lineClip is null
-            || editor.HasSelection
-            || editor.App?.Clipboard is not { } clipboard
-            || !clipboard.TryGetClipboardData (out string text)
-            || Flat (text) != Flat (lineClip))
-        {
-            return false;
-        }
+        return editor.App?.Clipboard is not { } clipboard
+               || !clipboard.TryGetClipboardData (out string text)
+               || Body (text) == Body (lineClip);
+    }
 
+    /// <summary>Inserts the clipped line above the caret's line, the way a line-wise copy is meant to land.</summary>
+    private static void PasteLine (Editor editor, TextDocument doc, string lineClip)
+    {
         int caret = editor.CaretOffset;
         int lineOffset = doc.GetLineByOffset (caret).Offset;
 
@@ -193,11 +260,12 @@ internal static class EditorKeys
         }
 
         editor.CaretOffset = caret + lineClip.Length;
-
-        return true;
     }
 
     private static string Flat (string text) => text.Replace ("\r\n", "\n");
+
+    /// <summary>The clip without its line delimiter, for comparing a copy against the clipboard.</summary>
+    private static string Body (string text) => Flat (text).TrimEnd ('\n');
 
     private static void InsertLine (Editor editor, TextDocument doc, bool below)
     {

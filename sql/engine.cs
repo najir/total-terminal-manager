@@ -11,7 +11,7 @@ internal static class Engine
 {
     public const string FileName = "total-manager.db";
 
-    private const int TargetSchemaVersion = 6;
+    private const int TargetSchemaVersion = 7;
 
     private static readonly string CreateNotes = CreateTable (Constants.NotesTable, Constants.NotesColumns);
 
@@ -37,6 +37,9 @@ internal static class Engine
 
     private static readonly string AddDeleted =
         $"ALTER TABLE {Constants.NotesTable} ADD COLUMN deleted {Constants.NotesColumns ["deleted"]};";
+
+    private static readonly string AddCategory =
+        $"ALTER TABLE {Constants.ResearchTable} ADD COLUMN category {Constants.ResearchColumns ["category"]};";
 
     private static string _connectionString = "";
 
@@ -141,6 +144,11 @@ internal static class Engine
         if (version < 6)
         {
             Execute (connection, transaction, CreateResearch);
+        }
+
+        if (version < 7 && !HasColumn (connection, transaction, Constants.ResearchTable, "category"))
+        {
+            Execute (connection, transaction, AddCategory);
         }
 
         Execute (connection, transaction, $"PRAGMA user_version = {TargetSchemaVersion};");

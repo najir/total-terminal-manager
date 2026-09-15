@@ -23,12 +23,13 @@ internal static class Constants
     public const string ResearchTable = "research";
 
     // The creation date is the database's own, in local time, so a row is dated by the write that
-    // made it - the Research page stores a name and a url and nothing else.
+    // made it - the Research page stores a name, a url and the category the link belongs to.
     public static readonly OrderedDictionary<string, string> ResearchColumns = new (StringComparer.OrdinalIgnoreCase)
     {
         ["id"] = "INTEGER PRIMARY KEY AUTOINCREMENT",
         ["name"] = "TEXT NOT NULL DEFAULT ''",
         ["url"] = "TEXT NOT NULL DEFAULT ''",
+        ["category"] = "TEXT NOT NULL DEFAULT 'None'",
         ["created"] = "TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))"
     };
 }
