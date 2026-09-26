@@ -313,9 +313,21 @@ internal static class UserSettings
 
     private static Dictionary<string, JsonNode?> _values = Clone (Defaults);
 
-    public static string FolderPath => Path.Combine (
-                                                     Environment.GetFolderPath (Environment.SpecialFolder.ApplicationData),
-                                                     FolderName);
+    public static string FolderPath =>
+        Environment.GetEnvironmentVariable (DataRootVariable) is { Length: > 0 } overridden
+            ? overridden
+            : Path.Combine (
+                            Environment.GetFolderPath (Environment.SpecialFolder.ApplicationData),
+                            FolderName);
+
+    /// <summary>
+    ///     Setting this to an absolute path relocates the whole data root - and therefore every
+    ///     folder it holds (settings, notes, database, scripts, ...) - away from
+    ///     `%APPDATA%\total-manager`. It is a test seam: E2E tests point it at a throwaway
+    ///     directory so they never read or write the live vault. Empty or unset means the
+    ///     default location.
+    /// </summary>
+    public const string DataRootVariable = "TTM_DATA";
 
     public static string FilePath => Path.Combine (FolderPath, FileName);
 

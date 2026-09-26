@@ -41,6 +41,32 @@ dotnet run
 
 ---
 
+## Testing (`tests/`)
+
+A small test suite lives in `tests/TTM.Tests` (xUnit, `net10.0`). There is no solution file yet,
+so point `dotnet test` at the project:
+
+```bash
+dotnet test tests/TTM.Tests
+```
+
+Test-only seams keep the suite off your real data:
+
+| Seam | Purpose |
+|---|---|
+| `UserSettings.FolderPath` honours the `TTM_DATA` env var | Relocates the whole data root (settings, notes, database, ...) to a throwaway temp directory. |
+| `InternalsVisibleTo` in `ttm.csproj` | Lets the test assembly reach internal pages and services. |
+
+| Test | What it covers |
+|---|---|
+| `NotesE2ETests.Create_Save_And_Reopen_From_Document_Viewer` | The note round trip: create + save (`DocumentationBuilder.Convert`), survive the startup `NotesSync.Run` reconcile, appear in the document-viewer list, and reopen with content intact. |
+
+> **Scope.** The current test is pipeline-level (no Terminal.Gui window): it drives the same code
+> the UI calls but deliberately skips the modal save dialog, whose file-picker needs a real
+> terminal. A headless UI E2E (Terminal.Gui `InjectKey` / `VirtualTimeProvider`) is the next step.
+
+---
+
 ## Tabs (top bar, left to right)
 
 | Tab | Source | What it shows | State |
@@ -341,8 +367,8 @@ Pick under **Settings > Theme**. Button shadows are forced off for performance.
 | Dash tab | Leftover test controls (`abc`, `ab2c`, `testa`, `test2`, "Welcome to Terminal.Gui v3!" label). |
 | `mode/tasks.cs` | Empty file. |
 | Window class names | `TodoTestWindow` and `ClaudeStatsTestWindow` are production tabs despite the `Test` suffix. |
-| Tests | None. |
-| Docs | This README is the only project documentation tracked in git. |
+| Tests | One test suite: `tests/TTM.Tests` (see [Testing](#testing-tests)). Pipeline-level only so far. |
+| Docs | `README.md` (usage) and `ARCHITECTURE.md` (implementation map) are the only documentation tracked in git. |
 
 ---
 
