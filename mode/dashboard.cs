@@ -73,11 +73,13 @@ internal sealed class DashWindow : Window
 
         FreshdeskWidget freshdesk = new ();
 
+        LinearWidget linear = new ();
+
         NotesWidget notes = new ();
 
         LinksWidget links = new ();
 
-        View recent = Layouts.Horizontal (reports, notes, freshdesk, links);
+        View recent = Layouts.Horizontal (reports, notes, freshdesk, linear, links);
         recent.X = 0;
         recent.Y = Pos.Bottom (work);
 

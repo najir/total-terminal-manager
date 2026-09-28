@@ -1789,6 +1789,262 @@ internal sealed class FreshdeskWidget : View
     }
 }
 
+/// <summary>One row of LinearWidget: the issue key, who created it, its title and its link.</summary>
+internal sealed record LinearIssue (string Key, string Who, string Title, string Url);
+
+/// <summary>
+///     Your most recently created Linear issues as a three-column table — key, who created each
+///     one, and its title. Fetches the first time it becomes visible, then again on a timer while
+///     it stays on screen.
+/// </summary>
+internal sealed class LinearWidget : View
+{
+    public const int DefaultAmount = 5;
+
+    private const int KeyWidth = 10;
+    private const int WhoWidth = 20;
+    private const int TitleWidth = 60;
+
+    private const string Endpoint = "https://api.linear.app/graphql";
+    private const string KeyVariable = "LINEAR_API_KEY";
+
+    private static readonly HttpClient Http = new () { Timeout = TimeSpan.FromSeconds (15) };
+
+    private readonly TableView _table;
+
+    private bool _loading;
+
+    private List<LinearIssue> _issues = new ();
+
+    public LinearWidget (
+        int amount = DefaultAmount,
+        Pos? x = null,
+        Pos? y = null,
+        Dim? width = null,
+        Dim? height = null)
+    {
+        Amount = Math.Clamp (amount, 1, 100);
+
+        Title = "Linear";
+        BorderStyle = Terminal.Gui.Drawing.LineStyle.Rounded;
+
+        this.AddCollapse ();
+
+        X = x ?? Pos.Absolute (0);
+        Y = y ?? Pos.Absolute (0);
+        Width = width ?? Dim.Auto ();
+        Height = height ?? Dim.Auto ();
+
+        _table = new ()
+        {
+            X = 0,
+            Y = 0,
+
+            Width = Dim.Auto (),
+            Height = Dim.Auto (),
+            FullRowSelect = true,
+            MultiSelect = false
+        };
+
+        _table.Style.ShowHorizontalHeaderUnderline = true;
+        _table.Style.ShowVerticalCellLines = true;
+
+        _table.Style.GetOrCreateColumnStyle (0).MaxWidth = KeyWidth;
+        _table.Style.GetOrCreateColumnStyle (1).MaxWidth = WhoWidth;
+        _table.Style.GetOrCreateColumnStyle (2).MaxWidth = TitleWidth;
+
+        _table.Accepted += (_, _) => Open ();
+
+        Add (_table);
+
+        Show (new List<LinearIssue> { new ("", "", "loading ...", "") });
+
+        this.OnShown (() => _ = LoadAsync ());
+
+        this.RefreshEvery (AutoRefresh.DefaultInterval, () => LoadAsync ());
+    }
+
+    public int Amount { get; }
+
+    public TableView Table => _table;
+
+    private async Task LoadAsync ()
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        _loading = true;
+
+        List<LinearIssue> rows;
+
+        try
+        {
+            rows = await FetchAsync (Amount);
+
+            if (rows.Count == 0)
+            {
+                rows.Add (new ("", "", "no issues", ""));
+            }
+        }
+        catch (Exception ex)
+        {
+            rows = new List<LinearIssue> { new ("!", "", Cap (Flatten (ex.Message), TitleWidth), "") };
+        }
+        finally
+        {
+            _loading = false;
+        }
+
+        Show (rows);
+    }
+
+    private static async Task<List<LinearIssue>> FetchAsync (int amount)
+    {
+        string query = $"{{ issues(first: {amount}, orderBy: createdAt) "
+                       + "{ nodes { identifier title url createdAt creator { name } } } }";
+
+        using HttpRequestMessage request = new (HttpMethod.Post, Endpoint)
+        {
+            Content = JsonContent.Create (new { query })
+        };
+
+        // Personal API keys go in raw; only OAuth tokens take a "Bearer " prefix.
+        request.Headers.TryAddWithoutValidation ("Authorization", Env.Require (KeyVariable));
+
+        using HttpResponseMessage response = await Http.SendAsync (request);
+
+        JsonElement body = await response.Content.ReadFromJsonAsync<JsonElement> ();
+
+        if (body.ValueKind == JsonValueKind.Object
+            && body.TryGetProperty ("errors", out JsonElement errors)
+            && errors.ValueKind == JsonValueKind.Array
+            && errors.GetArrayLength () > 0)
+        {
+            throw new HttpRequestException (Wire.Str (errors [0], "message") ?? response.StatusCode.ToString ());
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException (response.StatusCode.ToString ());
+        }
+
+        if (body.ValueKind != JsonValueKind.Object
+            || !body.TryGetProperty ("data", out JsonElement data)
+            || data.ValueKind != JsonValueKind.Object
+            || !data.TryGetProperty ("issues", out JsonElement issues)
+            || issues.ValueKind != JsonValueKind.Object
+            || !issues.TryGetProperty ("nodes", out JsonElement nodes)
+            || nodes.ValueKind != JsonValueKind.Array)
+        {
+            throw new HttpRequestException ("unexpected response from Linear");
+        }
+
+        // Sorted here as well so newest-first holds whichever way the server orders createdAt.
+        return nodes.EnumerateArray ()
+                    .OrderByDescending (issue => Wire.Str (issue, "createdAt") ?? "", StringComparer.Ordinal)
+                    .Select (Row)
+                    .ToList ();
+    }
+
+    private static LinearIssue Row (JsonElement issue) =>
+        new (
+             Cap (Wire.Str (issue, "identifier") ?? "", KeyWidth),
+             Cap (
+                  Wire.Str (issue, "creator", "name") is { Length: > 0 } name ? name : "unknown",
+                  WhoWidth),
+             Cap (
+                  Wire.Str (issue, "title") is { Length: > 0 } title ? title : "(no title)",
+                  TitleWidth),
+             Wire.Str (issue, "url") ?? "");
+
+    private static string Cap (string text, int max) =>
+        text.Length <= max ? text : max > 3 ? text [..(max - 3)] + "..." : text [..max];
+
+    private static string Flatten (string message) => message.Replace ("\r", " ").Replace ("\n", " ").Trim ();
+
+    private void Open ()
+    {
+        int row = _table.Value?.SelectedCell.Y ?? -1;
+
+        if (row < 0 || row >= _issues.Count)
+        {
+            return;
+        }
+
+        string url = _issues [row].Url;
+
+        if (url.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start (new ProcessStartInfo (url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.ErrorQuery (App!, "Cannot open", $"{url}\n\n{ex.Message}", new [] { "_Ok" });
+        }
+    }
+
+    private void Show (List<LinearIssue> rows)
+    {
+        Ui (() =>
+        {
+            _issues = rows;
+
+            ITableSource source = new EnumerableTableSource<LinearIssue> (
+                                                                          rows,
+                                                                          new Dictionary<string, Func<LinearIssue, object>>
+                                                                          {
+                                                                              ["ID"] = i => i.Key,
+                                                                              ["Who"] = i => i.Who,
+                                                                              ["Title"] = i => i.Title
+                                                                          });
+
+            _table.SetSource (source);
+
+            int wide = 0;
+
+            for (int column = 0; column < source.Columns; column++)
+            {
+                int longest = Enumerable.Range (0, source.Rows)
+                                        .Select (row => source [row, column]?.ToString ()?.Length ?? 0)
+                                        .DefaultIfEmpty (0)
+                                        .Max ();
+
+                wide += Math.Min (
+                                  Math.Max (source.ColumnNames [column].Length, longest),
+                                  _table.Style.GetOrCreateColumnStyle (column).MaxWidth)
+                        + 1;
+            }
+
+            _table.Width = Math.Max (1, wide);
+            _table.Refresh ();
+
+            this.Remeasure ();
+            this.ResizeLayout ();
+        });
+    }
+
+    private void Ui (Action action)
+    {
+        IApplication? app = App;
+
+        if (app is null)
+        {
+            action ();
+
+            return;
+        }
+
+        app.Invoke (action);
+    }
+}
+
 /// <summary>Everything one pass over the transcripts produces.</summary>
 internal sealed class ClaudeStats
 {

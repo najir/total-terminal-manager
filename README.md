@@ -45,7 +45,7 @@ dotnet run
 
 | Tab | Source | What it shows | State |
 |---|---|---|---|
-| **Dash** | `mode/dashboard.cs` | Landing page. Rows of widgets: meters (System, Processes, Next Up), work (Todo, Tasks), recent (Reports, Notes, Freshdesk, Links), feeds (Hacker News, Claude Sessions, Mail, Teams), lower (Git contributions + history, Script history, Review history, Projects). Scrolls vertically. | Usable. Still contains stray test buttons and labels. |
+| **Dash** | `mode/dashboard.cs` | Landing page. Rows of widgets: meters (System, Processes, Next Up), work (Todo, Tasks), recent (Reports, Notes, Freshdesk, Linear, Links), feeds (Hacker News, Claude Sessions, Mail, Teams), lower (Git contributions + history, Script history, Review history, Projects). Scrolls vertically. | Usable. Still contains stray test buttons and labels. |
 | **Tasks** | `mode/task.cs` | Task list stored in `tasks.json`. Add, complete, trash. | Usable |
 | **Todos** | `mode/todo.cs` | Scans a root folder for `TODO` markers, lists them, opens the file. | Usable |
 | **Stats** | `mode/claude-stats.cs` | Claude Code usage from `~/.claude/projects` transcripts: totals, 14-day token graph, top 5 tools, per-session table. | Usable |
@@ -123,6 +123,7 @@ dotnet run
 | `ReportsWidget` | Dash | Recent files in the reports folder; `.md` renders as a document. |
 | `NotesWidget` | Dash | Most recently modified notes; Enter opens in the Notes editor. |
 | `FreshdeskWidget` | Dash | Recent Freshdesk tickets (who, title). Timer refresh while visible. |
+| `LinearWidget` | Dash | Most recently created Linear issues (id, who, title), default 5. Enter opens the issue. Timer refresh while visible. |
 | `LinksWidget` | Dash | One button per bookmark in the `links` setting; opens the browser. |
 | `HackerNewsWidget` | Dash | Newest HN stories; Enter opens the story. |
 | `SessionsWidget` | Dash, Stats | Per-session Claude Code token spend. |
@@ -158,6 +159,7 @@ dotnet run
 | `GITHUB_USER`, `GITHUB_TOKEN` | `GitHistoryWidget`, `GitContributionsWidget` | Token is a read-scoped PAT. |
 | `CODEBERG_USER`, `CODEBERG_TOKEN` | Same widgets when `git-provider` = `codeberg` | |
 | `FRESHDESK_DOMAIN`, `FRESHDESK_API_KEY` | `FreshdeskWidget` | |
+| `LINEAR_API_KEY` | `LinearWidget` | Personal API key, sent without a `Bearer` prefix. |
 | `BACKDROP_FILE` / `BACKDROP` | `MainWindow` banner | File wins over inline; inline uses `\n` for line breaks. |
 
 Rules: a value already in the real environment wins over `.env`; blank values are ignored.
