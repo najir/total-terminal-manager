@@ -6,7 +6,7 @@
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <DefaultItemExcludes>$(DefaultItemExcludes);_archive/**;.backup/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);_archive/**;.backup/**;tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +18,11 @@
     <PackageReference Include="Microsoft.Identity.Client.Extensions.Msal" Version="4.88.0" />
     <PackageReference Include="Terminal.Gui" Version="2.6.0-develop.61" />
     <PackageReference Include="Terminal.Gui.Editor" Version="2.5.7" />
+  </ItemGroup>
+
+  <!-- Test-only seam: lets the TTM.Tests E2E suite reach internal pages and services. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="TTM.Tests" />
   </ItemGroup>
 
 </Project>
