@@ -177,17 +177,51 @@ internal static class TodoTable
     public static EnumerableTableSource<TodoHit> BuildSource (
         IEnumerable<TodoHit> hits,
         int fileTail = 0,
-        int textMax = 0) =>
-        new (hits, new Dictionary<string, Func<TodoHit, object>>
+        int textMax = 0,
+        bool showFile = true)
+    {
+        Dictionary<string, Func<TodoHit, object>> columns = new ()
         {
             ["Tag"] = h => h.Tag,
 
-            ["Modified"] = h => h.Modified.ToString ("MM-dd"),
-            ["File"] = h => Tail (h.File, fileTail),
-            ["Line"] = h => h.Line,
+            ["Modified"] = h => h.Modified.ToString ("MM-dd")
+        };
 
-            ["Text"] = h => Clip (h.Text, textMax)
-        });
+        // The narrowest layout drops the path; the widget still opens the file on Enter.
+        if (showFile)
+        {
+            columns ["File"] = h => Tail (h.File, fileTail);
+        }
+
+        columns ["Line"] = h => h.Line;
+        columns ["Text"] = h => Clip (h.Text, textMax);
+
+        return new (hits, columns);
+    }
+
+    /// <summary>Like BuildSource, over wrapped rows: only an item's first row shows its other cells.</summary>
+    public static EnumerableTableSource<WrapRow<TodoHit>> BuildWrappedSource (
+        IEnumerable<WrapRow<TodoHit>> rows,
+        int fileTail,
+        bool showFile)
+    {
+        Dictionary<string, Func<WrapRow<TodoHit>, object>> columns = new ()
+        {
+            ["Tag"] = r => r.First ? r.Item.Tag : "",
+
+            ["Modified"] = r => r.First ? r.Item.Modified.ToString ("MM-dd") : ""
+        };
+
+        if (showFile)
+        {
+            columns ["File"] = r => r.First ? Tail (r.Item.File, fileTail) : "";
+        }
+
+        columns ["Line"] = r => r.First ? r.Item.Line : "";
+        columns ["Text"] = r => r.Text;
+
+        return new (rows, columns);
+    }
 
     private static string Tail (string path, int max) =>
         max > 0 && path.Length > max ? "..." + path [^max..] : path;
@@ -199,20 +233,32 @@ internal static class TodoTable
                 ? text [..(max - 3)] + "..."
                 : text [..max];
 
-    public static void ApplyStyle (TableView table)
+    // The defaults are the full-size look. A scaled TodoWidget passes smaller minimums, and
+    // showFile = false when BuildSource left the File column out, which shifts the later columns.
+    public static void ApplyStyle (TableView table, bool showFile = true, int fileMin = 20, int textMin = 30)
     {
         table.Style.ShowHorizontalHeaderUnderline = true;
         table.Style.ShowVerticalCellLines = true;
         table.Style.ExpandLastColumn = true;
 
+        table.Style.ColumnStyles.Clear ();
+
         table.Style.GetOrCreateColumnStyle (0).MaxWidth = 6;
 
         table.Style.GetOrCreateColumnStyle (1).MaxWidth = 8;
-        table.Style.GetOrCreateColumnStyle (2).MinWidth = 20;
-        table.Style.GetOrCreateColumnStyle (2).MaxWidth = 60;
-        table.Style.GetOrCreateColumnStyle (3).Alignment = Alignment.End;
-        table.Style.GetOrCreateColumnStyle (3).MaxWidth = 7;
-        table.Style.GetOrCreateColumnStyle (4).MinWidth = 30;
+
+        int column = 2;
+
+        if (showFile)
+        {
+            table.Style.GetOrCreateColumnStyle (column).MinWidth = Math.Min (20, fileMin);
+            table.Style.GetOrCreateColumnStyle (column).MaxWidth = 60;
+            column++;
+        }
+
+        table.Style.GetOrCreateColumnStyle (column).Alignment = Alignment.End;
+        table.Style.GetOrCreateColumnStyle (column).MaxWidth = 7;
+        table.Style.GetOrCreateColumnStyle (column + 1).MinWidth = Math.Min (30, textMin);
     }
 }
 
@@ -220,18 +266,35 @@ internal static class TodoTable
 ///     A table of the amount oldest todos under the user's file roots — the file-roots list in
 ///     user-settings, the same one the AI file tools use.
 /// </summary>
-internal sealed class TodoWidget : View
+internal sealed class TodoWidget : View, IResponsive
 {
     public const int DefaultAmount = 15;
 
     private const int FilePathTail = 30;
 
+    // Narrowest useful File column ("..." plus the path tail); below this it is dropped.
+    private const int MinFileColumn = 15;
+
+    // Tag (6), Modified (8) and Line (7) at their widest, plus the 5 vertical lines of a table
+    // without File: what the Text column gets the rest of. File adds its width and one more line.
+    private const int FixedColumns = 26;
+
     private readonly TableView _table;
     private readonly object _gate = new ();
 
     private List<TodoHit> _hits = new ();
+    private List<TodoHit> _rows = new ();
+
+    // The table's display rows when scaled; a wrapped Text spans several (see TableWrap).
+    private List<WrapRow<TodoHit>>? _display;
     private CancellationTokenSource? _cts;
     private bool _started;
+
+    // The widths in use; ApplySize changes them, the constructor values are the full-size look.
+    private int _fileTail = FilePathTail;
+    private int _textWidth;
+    private bool _showFile = true;
+    private bool _scaled;
 
     public TodoWidget (
         int amount = DefaultAmount,
@@ -244,6 +307,7 @@ internal sealed class TodoWidget : View
         Amount = Math.Max (0, amount);
 
         TextWidth = Math.Max (0, textWidth);
+        _textWidth = TextWidth;
 
         Title = "Todos";
         BorderStyle = Terminal.Gui.Drawing.LineStyle.Rounded;
@@ -293,6 +357,45 @@ internal sealed class TodoWidget : View
 
     public IReadOnlyList<TodoHit> Hits => _hits;
 
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        bool scaled = ResponsiveWidth.Scaled (size);
+        int fileTail = FilePathTail;
+        int textWidth = TextWidth;
+        bool showFile = true;
+
+        if (scaled)
+        {
+            // What Text would get on its own. File, if shown, takes up to half of it plus one more
+            // vertical line, and is dropped (always on Tiny) when that half is too narrow to be useful.
+            int room = availableWidth - FixedColumns;
+            int fileColumn = Math.Min (FilePathTail + 3, (room - 1) / 2);
+
+            if (size != SizeClass.Tiny && fileColumn >= MinFileColumn)
+            {
+                fileTail = fileColumn - 3;
+                textWidth = Math.Clamp (room - 1 - fileColumn, 1, TextWidth);
+            }
+            else
+            {
+                showFile = false;
+                textWidth = Math.Clamp (room, 1, TextWidth);
+            }
+        }
+
+        if (scaled == _scaled && fileTail == _fileTail && textWidth == _textWidth && showFile == _showFile)
+        {
+            return;
+        }
+
+        _scaled = scaled;
+        _fileTail = fileTail;
+        _textWidth = textWidth;
+        _showFile = showFile;
+
+        Show (_rows);
+    }
+
     public TableView Table => _table;
 
     public TodoHit? Selected
@@ -300,6 +403,11 @@ internal sealed class TodoWidget : View
         get
         {
             int row = _table.Value?.SelectedCell.Y ?? -1;
+
+            if (_display is not null)
+            {
+                row = TableWrap.ItemAt (_display, row);
+            }
 
             return row >= 0 && row < _hits.Count ? _hits [row] : null;
         }
@@ -357,11 +465,26 @@ internal sealed class TodoWidget : View
     {
         Ui (() =>
         {
+            _rows = rows;
             _hits = rows.Count == 1 && rows [0].FullPath.Length == 0 ? new () : rows;
 
             Title = _hits.Count > 0 ? $"Todos ({_hits.Count})" : "Todos";
 
-            ITableSource source = TodoTable.BuildSource (rows, FilePathTail, TextWidth);
+            // Scaled: Text wraps onto extra rows instead of being cut. Full size: the shared table as before.
+            _display = _scaled ? TableWrap.Expand (rows, h => h.Text, _textWidth) : null;
+
+            ITableSource source = _display is not null
+                                      ? TodoTable.BuildWrappedSource (_display, _fileTail, _showFile)
+                                      : TodoTable.BuildSource (rows, _fileTail, _textWidth, _showFile);
+
+            if (_textWidth != TextWidth || !_showFile)
+            {
+                TodoTable.ApplyStyle (_table, _showFile, _fileTail + 3, _textWidth);
+            }
+            else
+            {
+                TodoTable.ApplyStyle (_table);
+            }
 
             _table.SetSource (source);
 
@@ -380,7 +503,7 @@ internal sealed class TodoWidget : View
                         + 1;
             }
 
-            _table.Width = Math.Max (1, wide);
+            _table.FitWidth (wide);
             _table.Refresh ();
 
             this.Remeasure ();
@@ -422,13 +545,15 @@ internal sealed class TodoWidget : View
 ///     Whatever is in next-up.txt, shown as-is. Re-read every time the tab comes back into view, so
 ///     editing the file shows up without a restart.
 /// </summary>
-internal sealed class NextUpWidget : View
+internal sealed class NextUpWidget : View, IResponsive
 {
     public static string FilePath => Path.Combine (UserSettings.FolderPath, "next-up.txt");
 
     private const string Nothing = "Next up could not be read or does not exist...";
 
     private readonly Label _text;
+
+    private int _wrapWidth = WrapWidth;
 
     public NextUpWidget (Pos? x = null, Pos? y = null, Dim? width = null, Dim? height = null)
     {
@@ -460,8 +585,23 @@ internal sealed class NextUpWidget : View
     }
 
     private const int WrapWidth = 120;
+    private const int MinWrapWidth = 10;
 
-    private static string Read ()
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        int wrap = ResponsiveWidth.Scaled (size) ? ResponsiveWidth.Fit (availableWidth, 0, MinWrapWidth, WrapWidth) : WrapWidth;
+
+        if (wrap == _wrapWidth)
+        {
+            return;
+        }
+
+        _wrapWidth = wrap;
+
+        Reload ();
+    }
+
+    private string Read ()
     {
         try
         {
@@ -473,17 +613,17 @@ internal sealed class NextUpWidget : View
         }
     }
 
-    private static string Wrap (string content) =>
+    private string Wrap (string content) =>
         string.Join (Environment.NewLine,
                      content.Split (["\r\n", "\n"], StringSplitOptions.None)
-                            .SelectMany (line => Wire.Wrap (line, WrapWidth)));
+                            .SelectMany (line => Wire.Wrap (line, _wrapWidth)));
 }
 
 /// <summary>
 ///     Live CPU and RAM meters in one panel — a labelled readout and a bar for each, resampled on a
 ///     timer. 30% wide by default; set X/Y/Width/Height to override.
 /// </summary>
-internal sealed class SystemWidget : View
+internal sealed class SystemWidget : View, IResponsive
 {
     public const int RequiredHeight = 4;
 
@@ -492,6 +632,7 @@ internal sealed class SystemWidget : View
     private const int ReadoutWidth = 10;
     private const int DiskWidth = 14;
     private const int BarWidth = 12;
+    private const int TinyBarWidth = 8;
 
     private static readonly uint StatusLength = (uint) Marshal.SizeOf<MemoryStatus> ();
 
@@ -512,6 +653,10 @@ internal sealed class SystemWidget : View
 
     private int _ticks;
     private object? _timer;
+
+    // Scaled layout: one meter per line instead of two columns, with narrower bars on Tiny.
+    private bool _stacked;
+    private int _barWidth = BarWidth;
 
     public SystemWidget (
         Pos? x = null,
@@ -636,9 +781,55 @@ internal sealed class SystemWidget : View
         return true;
     }
 
-    private static void Set (ProgressBar bar, float fraction)
+    public void ApplySize (SizeClass size, int availableWidth)
     {
-        float quantised = MathF.Floor (Math.Clamp (fraction, 0f, 1f) * BarWidth) / BarWidth;
+        bool stacked = ResponsiveWidth.Scaled (size);
+        int barWidth = size == SizeClass.Tiny ? TinyBarWidth : BarWidth;
+
+        if (stacked == _stacked && barWidth == _barWidth)
+        {
+            return;
+        }
+
+        _stacked = stacked;
+        _barWidth = barWidth;
+
+        foreach (ProgressBar bar in new [] { _cpuBar, _ramBar, _diskBar, _battBar })
+        {
+            bar.Width = _barWidth;
+        }
+
+        if (_stacked)
+        {
+            // CPU, RAM, DISK, BATT down one column; every bar starts after the widest readout.
+            _cpuBar.X = _ramBar.X = DiskWidth + 1;
+            _diskText.X = _battText.X = 0;
+            _diskText.Y = 2;
+            _battText.Y = 3;
+            _diskBar.X = _battBar.X = DiskWidth + 1;
+            _diskBar.Y = 2;
+            _battBar.Y = 3;
+        }
+        else
+        {
+            _cpuBar.X = _ramBar.X = ReadoutWidth + 1;
+            _diskText.X = Pos.Right (_cpuBar) + 2;
+            _diskText.Y = 0;
+            _battText.X = Pos.Left (_diskText);
+            _battText.Y = 1;
+            _diskBar.X = Pos.Right (_diskText) + 1;
+            _diskBar.Y = 0;
+            _battBar.X = Pos.Left (_diskBar);
+            _battBar.Y = 1;
+        }
+
+        this.Remeasure ();
+        this.ResizeLayout ();
+    }
+
+    private void Set (ProgressBar bar, float fraction)
+    {
+        float quantised = MathF.Floor (Math.Clamp (fraction, 0f, 1f) * _barWidth) / _barWidth;
 
         if (bar.Fraction != quantised)
         {
@@ -831,12 +1022,13 @@ internal sealed record ProcessLoad (string Name, long Ram, double Cpu, double Gp
 ///     The heaviest processes right now - name, memory, CPU and GPU - one row each and no header,
 ///     so a three-row panel costs three rows.
 /// </summary>
-internal sealed class ProcessesWidget : View
+internal sealed class ProcessesWidget : View, IResponsive
 {
     public const int DefaultAmount = 3;
 
     private const int IntervalMs = 12000;
     private const int NameWidth = 18;
+    private const int ScaledNameWidth = 10;
 
     private readonly TableView _table;
     private readonly int _amount;
@@ -851,6 +1043,9 @@ internal sealed class ProcessesWidget : View
     private bool _disposed;
 
     private List<string>? _lastCells;
+    private List<ProcessLoad> _lastLoads = new ();
+
+    private int _nameWidth = NameWidth;
 
     public ProcessesWidget (
         int amount = DefaultAmount,
@@ -887,7 +1082,7 @@ internal sealed class ProcessesWidget : View
 
         _columns = new ()
         {
-            ["Name"] = l => l.Name.Length <= NameWidth ? l.Name : l.Name [.. (NameWidth - 1)] + "…",
+            ["Name"] = l => l.Name.Length <= _nameWidth ? l.Name : l.Name [.. (_nameWidth - 1)] + "…",
             ["Ram"] = l => Memory (l.Ram),
             ["Cpu"] = l => l.Cpu.ToString ("0.0") + "%",
             ["Gpu"] = l => _gpu.Available ? l.Gpu.ToString ("0.0") + "%" : "n/a"
@@ -1028,8 +1223,25 @@ internal sealed class ProcessesWidget : View
         return loads.OrderByDescending (l => l.Weight).Take (_amount).ToList ();
     }
 
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        int nameWidth = ResponsiveWidth.Scaled (size) ? ScaledNameWidth : NameWidth;
+
+        if (nameWidth == _nameWidth)
+        {
+            return;
+        }
+
+        _nameWidth = nameWidth;
+
+        // The names change length, so the cell comparison in Render sees new cells and redraws.
+        Render (_lastLoads);
+    }
+
     private void Render (List<ProcessLoad> loads)
     {
+        _lastLoads = loads;
+
         List<ProcessLoad> rows = loads.Count > 0 ? loads : [new ("no readings", 0, 0, 0)];
 
         List<string> cells = rows.SelectMany (r => _columns.Values.Select (cell => cell (r).ToString ()!)).ToList ();
@@ -1053,12 +1265,11 @@ internal sealed class ProcessesWidget : View
             wide += Math.Min (longest, _table.Style.GetOrCreateColumnStyle (index++).MaxWidth);
         }
 
-        bool resized = _table.Width is not DimAbsolute { Size: var w } || w != wide
-                       || _table.Height is not DimAbsolute { Size: var h } || h != rows.Count;
+        bool resized = _table.FitWidth (wide)
+                       | (_table.Height is not DimAbsolute { Size: var h } || h != rows.Count);
 
         if (resized)
         {
-            _table.Width = wide;
             _table.Height = rows.Count;
         }
 
@@ -1075,9 +1286,13 @@ internal sealed class ProcessesWidget : View
         bytes >= 1073741824 ? (bytes / 1073741824.0).ToString ("0.0") + " GB" : (bytes / 1048576.0).ToString ("0") + " MB";
 }
 
-internal sealed class HackerNewsWidget : View
+internal sealed class HackerNewsWidget : View, IResponsive
 {
     private const int TitleWidth = 50;
+    private const int MinTitleWidth = 10;
+
+    // "MM-dd  " in front of each story.
+    private const int DateWidth = 7;
 
     private const string Heading = "Hacker News";
 
@@ -1089,6 +1304,13 @@ internal sealed class HackerNewsWidget : View
 
     private readonly ListView _list;
     private readonly List<string> _urls = new ();
+
+    // Stories are kept whole and cut to _titleWidth when drawn, so a resize can redraw them.
+    // A null date marks a status line ("no stories", errors).
+    private List<(DateTime? When, string Title)> _stories = new ();
+
+    private int _titleWidth = TitleWidth;
+    private bool _showDate = true;
 
     private bool _loading;
 
@@ -1133,7 +1355,7 @@ internal sealed class HackerNewsWidget : View
 
         _loading = true;
 
-        ObservableCollection<string> rows = new ();
+        List<(DateTime? When, string Title)> rows = new ();
         List<string> urls = new ();
 
         try
@@ -1146,18 +1368,18 @@ internal sealed class HackerNewsWidget : View
 
             foreach (JsonElement item in items)
             {
-                if (!TryRead (item, out string row, out string url))
+                if (!TryRead (item, out DateTime when, out string title, out string url))
                 {
                     continue;
                 }
 
-                rows.Add (row);
+                rows.Add ((when, title));
                 urls.Add (url);
             }
 
             if (rows.Count == 0)
             {
-                rows.Add (ids.Length == 0 ? "no stories" : "hacker news unavailable");
+                rows.Add ((null, ids.Length == 0 ? "no stories" : "hacker news unavailable"));
                 urls.Add (HomePage);
             }
         }
@@ -1166,7 +1388,7 @@ internal sealed class HackerNewsWidget : View
             rows.Clear ();
             urls.Clear ();
 
-            rows.Add ($"hacker news unavailable: {Summarise (ex)}");
+            rows.Add ((null, $"hacker news unavailable: {Summarise (ex)}"));
             urls.Add (HomePage);
         }
         finally
@@ -1189,9 +1411,10 @@ internal sealed class HackerNewsWidget : View
         }
     }
 
-    private static bool TryRead (JsonElement item, out string row, out string url)
+    private static bool TryRead (JsonElement item, out DateTime when, out string title, out string url)
     {
-        row = "";
+        when = default;
+        title = "";
         url = "";
 
         if (item.ValueKind != JsonValueKind.Object)
@@ -1199,13 +1422,11 @@ internal sealed class HackerNewsWidget : View
             return false;
         }
 
-        string title = item.TryGetProperty ("title", out JsonElement t) ? t.GetString () ?? "" : "";
+        title = item.TryGetProperty ("title", out JsonElement t) ? t.GetString () ?? "" : "";
 
-        DateTime when = DateTimeOffset
+        when = DateTimeOffset
                         .FromUnixTimeSeconds (item.TryGetProperty ("time", out JsonElement s) ? s.GetInt64 () : 0)
                         .LocalDateTime;
-
-        row = $"{when:MM-dd}  {(title.Length > TitleWidth ? title [..TitleWidth] + "..." : title)}";
 
         url = item.TryGetProperty ("url", out JsonElement u) && u.GetString () is { Length: > 0 } link
                   ? link
@@ -1223,7 +1444,50 @@ internal sealed class HackerNewsWidget : View
         return message.Length > TitleWidth ? message [..TitleWidth] + "..." : message;
     }
 
-    private void Show (ObservableCollection<string> rows, List<string> urls)
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        bool showDate = size != SizeClass.Tiny;
+        int titleWidth = TitleWidth;
+
+        if (ResponsiveWidth.Scaled (size))
+        {
+            // Room for the "..." that a cut title ends in.
+            titleWidth = ResponsiveWidth.Fit (availableWidth, (showDate ? DateWidth : 0) + 3, MinTitleWidth, TitleWidth);
+        }
+
+        if (titleWidth == _titleWidth && showDate == _showDate)
+        {
+            return;
+        }
+
+        _titleWidth = titleWidth;
+        _showDate = showDate;
+
+        Render ();
+    }
+
+    private string Format ((DateTime? When, string Title) story)
+    {
+        if (story.When is not DateTime when)
+        {
+            // Status lines are only cut when scaled, so the full-size look is unchanged.
+            return _titleWidth == TitleWidth && _showDate ? story.Title : ResponsiveWidth.Cap (story.Title, _titleWidth + 3);
+        }
+
+        string title = story.Title.Length > _titleWidth ? story.Title [.._titleWidth] + "..." : story.Title;
+
+        return _showDate ? $"{when:MM-dd}  {title}" : title;
+    }
+
+    private void Render ()
+    {
+        ObservableCollection<string> rows = new (_stories.Select (Format));
+
+        _list.SetSource (rows);
+        Fit (_list, rows);
+    }
+
+    private void Show (List<(DateTime? When, string Title)> rows, List<string> urls)
     {
         try
         {
@@ -1233,8 +1497,8 @@ internal sealed class HackerNewsWidget : View
 
             _urls.Clear ();
             _urls.AddRange (urls);
-            _list.SetSource (rows);
-            Fit (_list, rows);
+            _stories = rows;
+            Render ();
         }
         catch (Exception ex)
         {
@@ -1257,13 +1521,21 @@ internal sealed class HackerNewsWidget : View
 ///     The last few Teams messages across all of your chats — who sent it, what it said, and how
 ///     long ago. Refetches every time it becomes visible.
 /// </summary>
-internal sealed class TeamsWidget : View
+internal sealed class TeamsWidget : View, IResponsive
 {
     private const int TextWidth = 60;
+    private const int MinTextWidth = 10;
 
     private static readonly HttpClient Http = new () { Timeout = TimeSpan.FromSeconds (15) };
 
     private readonly ListView _list;
+
+    // Rows are kept whole and cut when drawn, so a resize can redraw them. A null prefix is a
+    // status line ("no recent messages", errors), shown as-is at full size.
+    private List<(string? Prefix, string Text)> _rows = new ();
+
+    private bool _scaled;
+    private int _available;
 
     public TeamsWidget (
         int count = 5,
@@ -1291,7 +1563,7 @@ internal sealed class TeamsWidget : View
 
     private async Task LoadAsync (int count)
     {
-        ObservableCollection<string> rows = new ();
+        List<(string? Prefix, string Text)> rows = new ();
 
         try
         {
@@ -1302,7 +1574,7 @@ internal sealed class TeamsWidget : View
             string token = await GraphAuth.TokenAsync (
                                                        message => App?.Invoke (
                                                         () => _list.SetSource (
-                                                         new ObservableCollection<string> (Wire.Wrap (message, TextWidth)))));
+                                                         new ObservableCollection<string> (Wire.Wrap (message, WrapWidth ())))));
 
             request.Headers.Authorization = new ("Bearer", token);
 
@@ -1333,24 +1605,24 @@ internal sealed class TeamsWidget : View
                                       ? sent
                                       : DateTimeOffset.UtcNow);
 
-                rows.Add ($"{Ago (age),8}  {who}: {(text.Length > TextWidth ? text [..TextWidth] + "..." : text)}");
+                rows.Add (($"{Ago (age),8}  {who}: ", text));
             }
 
             if (rows.Count == 0)
             {
-                rows.Add ("no recent messages");
+                rows.Add ((null, "no recent messages"));
             }
         }
         catch (Exception ex)
         {
-            rows.Add ($"teams unavailable: {ex.Message}");
+            rows.Add ((null, $"teams unavailable: {ex.Message}"));
         }
 
         App?.Invoke (
                      () =>
                      {
-                         _list.SetSource (rows);
-                         Fit (_list, rows);
+                         _rows = rows;
+                         Render ();
                      });
     }
 
@@ -1362,6 +1634,45 @@ internal sealed class TeamsWidget : View
         { TotalDays: < 7 } => $"{(int) age.TotalDays}d ago",
         _ => $"{(int) (age.TotalDays / 7)}w ago"
     };
+
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        bool scaled = ResponsiveWidth.Scaled (size);
+
+        if (scaled == _scaled && (!scaled || availableWidth == _available))
+        {
+            return;
+        }
+
+        _scaled = scaled;
+        _available = availableWidth;
+
+        Render ();
+    }
+
+    // Width for sign-in prompts and other wrapped messages.
+    private int WrapWidth () => _scaled ? ResponsiveWidth.Fit (_available, 0, MinTextWidth, TextWidth) : TextWidth;
+
+    private string Format ((string? Prefix, string Text) row)
+    {
+        if (row.Prefix is not string prefix)
+        {
+            return _scaled ? ResponsiveWidth.Cap (row.Text, _available) : row.Text;
+        }
+
+        // Each row's text gets what its prefix leaves, plus room for the "...".
+        int width = _scaled ? ResponsiveWidth.Fit (_available, prefix.Length + 3, MinTextWidth, TextWidth) : TextWidth;
+
+        return prefix + (row.Text.Length > width ? row.Text [..width] + "..." : row.Text);
+    }
+
+    private void Render ()
+    {
+        ObservableCollection<string> rows = new (_rows.Select (Format));
+
+        _list.SetSource (rows);
+        Fit (_list, rows);
+    }
 
     private static void Fit (ListView list, ICollection<string> rows)
     {
@@ -1375,13 +1686,21 @@ internal sealed class TeamsWidget : View
 }
 
 /// <summary>Your last few inbox emails — sender and subject, newest first.</summary>
-internal sealed class MailWidget : View
+internal sealed class MailWidget : View, IResponsive
 {
     private const int TextWidth = 60;
+    private const int MinTextWidth = 10;
 
     private static readonly HttpClient Http = new () { Timeout = TimeSpan.FromSeconds (15) };
 
     private readonly ListView _list;
+
+    // Rows are kept whole and cut when drawn, so a resize can redraw them. A null prefix is a
+    // status line ("no recent messages", errors), shown as-is at full size.
+    private List<(string? Prefix, string Text)> _rows = new ();
+
+    private bool _scaled;
+    private int _available;
 
     public MailWidget (
         int count = 10,
@@ -1410,7 +1729,7 @@ internal sealed class MailWidget : View
     private async Task LoadAsync (int count)
     {
         string provider = UserSettings.Get (UserSettings.EmailProvider);
-        List<string> rows = new ();
+        List<(string? Prefix, string Text)> rows = new ();
 
         try
         {
@@ -1418,25 +1737,23 @@ internal sealed class MailWidget : View
 
             if (rows.Count == 0)
             {
-                rows.Add ("inbox is empty");
+                rows.Add ((null, "inbox is empty"));
             }
         }
         catch (Exception ex)
         {
-            rows.Add ($"{provider} mail unavailable: {ex.Message}");
+            rows.Add ((null, $"{provider} mail unavailable: {ex.Message}"));
         }
 
         App?.Invoke (() =>
         {
             Title = $"Inbox ({provider})";
-            ObservableCollection<string> source = new (rows);
-
-            _list.SetSource (source);
-            Fit (_list, source);
+            _rows = rows;
+            Render ();
         });
     }
 
-    private async Task<List<string>> GraphAsync (int count)
+    private async Task<List<(string? Prefix, string Text)>> GraphAsync (int count)
     {
         using HttpRequestMessage request = new (
                                                 HttpMethod.Get,
@@ -1451,7 +1768,7 @@ internal sealed class MailWidget : View
                                                                          message => App?.Invoke (
                                                                           () => _list.SetSource (
                                                                            new ObservableCollection<string> (
-                                                                            Wire.Wrap (message, TextWidth))))));
+                                                                            Wire.Wrap (message, WrapWidth ()))))));
 
         using HttpResponseMessage response = await Http.SendAsync (request);
 
@@ -1472,7 +1789,7 @@ internal sealed class MailWidget : View
                    .ToList ();
     }
 
-    private async Task<List<string>> GmailAsync (int count)
+    private async Task<List<(string? Prefix, string Text)>> GmailAsync (int count)
     {
         string token = await GmailAuth.TokenAsync ();
 
@@ -1498,7 +1815,7 @@ internal sealed class MailWidget : View
 
         if (!list.TryGetProperty ("messages", out JsonElement ids))
         {
-            return new List<string> ();
+            return new List<(string? Prefix, string Text)> ();
         }
 
         JsonElement[] mails = await Task.WhenAll (
@@ -1528,11 +1845,46 @@ internal sealed class MailWidget : View
         return bracket > 0 ? from! [..bracket].Trim ().Trim ('"') : from;
     }
 
-    private static string Row (string? who, string? subject)
-    {
-        subject ??= "(no subject)";
+    private static (string? Prefix, string Text) Row (string? who, string? subject) =>
+        ($"{who ?? "unknown"}: ", subject ?? "(no subject)");
 
-        return $"{who ?? "unknown"}: {(subject.Length > TextWidth ? subject [..TextWidth] + "..." : subject)}";
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        bool scaled = ResponsiveWidth.Scaled (size);
+
+        if (scaled == _scaled && (!scaled || availableWidth == _available))
+        {
+            return;
+        }
+
+        _scaled = scaled;
+        _available = availableWidth;
+
+        Render ();
+    }
+
+    // Width for sign-in prompts and other wrapped messages.
+    private int WrapWidth () => _scaled ? ResponsiveWidth.Fit (_available, 0, MinTextWidth, TextWidth) : TextWidth;
+
+    private string Format ((string? Prefix, string Text) row)
+    {
+        if (row.Prefix is not string prefix)
+        {
+            return _scaled ? ResponsiveWidth.Cap (row.Text, _available) : row.Text;
+        }
+
+        // Each row's text gets what its prefix leaves, plus room for the "...".
+        int width = _scaled ? ResponsiveWidth.Fit (_available, prefix.Length + 3, MinTextWidth, TextWidth) : TextWidth;
+
+        return prefix + (row.Text.Length > width ? row.Text [..width] + "..." : row.Text);
+    }
+
+    private void Render ()
+    {
+        ObservableCollection<string> rows = new (_rows.Select (Format));
+
+        _list.SetSource (rows);
+        Fit (_list, rows);
     }
 
     private static void Fit (ListView list, ICollection<string> rows)
@@ -1554,7 +1906,7 @@ internal sealed record FreshdeskTicket (long Id, string Who, string Title);
 ///     title. Fetches the first time it becomes visible, then again on a timer while it stays on
 ///     screen.
 /// </summary>
-internal sealed class FreshdeskWidget : View
+internal sealed class FreshdeskWidget : View, IResponsive
 {
     public const int DefaultAmount = 5;
 
@@ -1571,6 +1923,15 @@ internal sealed class FreshdeskWidget : View
     private bool _loading;
 
     private List<FreshdeskTicket> _tickets = new ();
+
+    // The table's display rows; a wrapped title spans several (see TableWrap).
+    private List<WrapRow<FreshdeskTicket>> _display = new ();
+
+    // Scaled layout: the Who column is dropped and titles are cut to _titleWidth.
+    private const int MinTitleWidth = 10;
+
+    private bool _showWho = true;
+    private int _titleWidth = TitleWidth;
 
     public FreshdeskWidget (
         int amount = DefaultAmount,
@@ -1605,9 +1966,6 @@ internal sealed class FreshdeskWidget : View
         _table.Style.ShowHorizontalHeaderUnderline = true;
         _table.Style.ShowVerticalCellLines = true;
 
-        _table.Style.GetOrCreateColumnStyle (0).MaxWidth = WhoWidth;
-        _table.Style.GetOrCreateColumnStyle (1).MaxWidth = TitleWidth;
-
         _table.Accepted += (_, _) => Open ();
 
         Add (_table);
@@ -1622,6 +1980,25 @@ internal sealed class FreshdeskWidget : View
     public int Amount { get; }
 
     public TableView Table => _table;
+
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        bool scaled = ResponsiveWidth.Scaled (size);
+        bool showWho = !scaled;
+
+        // Title column, its cell line and the "..." of a cut title.
+        int titleWidth = scaled ? ResponsiveWidth.Fit (availableWidth, 2, MinTitleWidth, TitleWidth) : TitleWidth;
+
+        if (showWho == _showWho && titleWidth == _titleWidth)
+        {
+            return;
+        }
+
+        _showWho = showWho;
+        _titleWidth = titleWidth;
+
+        Show (_tickets);
+    }
 
     private async Task LoadAsync ()
     {
@@ -1698,9 +2075,8 @@ internal sealed class FreshdeskWidget : View
                       ? name
                       : Wire.Str (ticket, "requester", "email") ?? "unknown",
                   WhoWidth),
-             Cap (
-                  Wire.Str (ticket, "subject") is { Length: > 0 } subject ? subject : "(no subject)",
-                  TitleWidth));
+             // Kept whole: Show cuts it at full size and wraps it when scaled.
+             Wire.Str (ticket, "subject") is { Length: > 0 } subject ? subject : "(no subject)");
 
     private static string Cap (string text, int max) =>
         text.Length <= max ? text : max > 3 ? text [..(max - 3)] + "..." : text [..max];
@@ -1709,7 +2085,7 @@ internal sealed class FreshdeskWidget : View
 
     private void Open ()
     {
-        int row = _table.Value?.SelectedCell.Y ?? -1;
+        int row = TableWrap.ItemAt (_display, _table.Value?.SelectedCell.Y ?? -1);
 
         if (row < 0 || row >= _tickets.Count)
         {
@@ -1741,13 +2117,33 @@ internal sealed class FreshdeskWidget : View
         {
             _tickets = rows;
 
-            ITableSource source = new EnumerableTableSource<FreshdeskTicket> (
-                                                                              rows,
-                                                                              new Dictionary<string, Func<FreshdeskTicket, object>>
-                                                                              {
-                                                                                  ["Who"] = t => t.Who,
-                                                                                  ["Title"] = t => t.Title
-                                                                              });
+            // Scaled: titles wrap onto extra rows instead of being cut. Full size: one row each, cut as before.
+            _display = _showWho
+                           ? rows.Select ((t, i) => new WrapRow<FreshdeskTicket> (t, i, ResponsiveWidth.Cap (t.Title, _titleWidth), true)).ToList ()
+                           : TableWrap.Expand (rows, t => t.Title, _titleWidth);
+
+            Dictionary<string, Func<WrapRow<FreshdeskTicket>, object>> columns = new ();
+
+            if (_showWho)
+            {
+                columns ["Who"] = r => r.First ? r.Item.Who : "";
+            }
+
+            columns ["Title"] = r => r.Text;
+
+            ITableSource source = new EnumerableTableSource<WrapRow<FreshdeskTicket>> (_display, columns);
+
+            // Column styles go by index, and dropping Who moves Title to the front.
+            _table.Style.ColumnStyles.Clear ();
+
+            int styled = 0;
+
+            if (_showWho)
+            {
+                _table.Style.GetOrCreateColumnStyle (styled++).MaxWidth = WhoWidth;
+            }
+
+            _table.Style.GetOrCreateColumnStyle (styled).MaxWidth = _titleWidth;
 
             _table.SetSource (source);
 
@@ -1766,7 +2162,7 @@ internal sealed class FreshdeskWidget : View
                         + 1;
             }
 
-            _table.Width = Math.Max (1, wide);
+            _table.FitWidth (wide);
             _table.Refresh ();
 
             this.Remeasure ();
@@ -1797,7 +2193,7 @@ internal sealed record LinearIssue (string Key, string Who, string Title, string
 ///     one, and its title. Fetches the first time it becomes visible, then again on a timer while
 ///     it stays on screen.
 /// </summary>
-internal sealed class LinearWidget : View
+internal sealed class LinearWidget : View, IResponsive
 {
     public const int DefaultAmount = 5;
 
@@ -1815,6 +2211,15 @@ internal sealed class LinearWidget : View
     private bool _loading;
 
     private List<LinearIssue> _issues = new ();
+
+    // The table's display rows; a wrapped title spans several (see TableWrap).
+    private List<WrapRow<LinearIssue>> _display = new ();
+
+    // Scaled layout: the Who column is dropped and titles are cut to _titleWidth.
+    private const int MinTitleWidth = 10;
+
+    private bool _showWho = true;
+    private int _titleWidth = TitleWidth;
 
     public LinearWidget (
         int amount = DefaultAmount,
@@ -1849,10 +2254,6 @@ internal sealed class LinearWidget : View
         _table.Style.ShowHorizontalHeaderUnderline = true;
         _table.Style.ShowVerticalCellLines = true;
 
-        _table.Style.GetOrCreateColumnStyle (0).MaxWidth = KeyWidth;
-        _table.Style.GetOrCreateColumnStyle (1).MaxWidth = WhoWidth;
-        _table.Style.GetOrCreateColumnStyle (2).MaxWidth = TitleWidth;
-
         _table.Accepted += (_, _) => Open ();
 
         Add (_table);
@@ -1867,6 +2268,25 @@ internal sealed class LinearWidget : View
     public int Amount { get; }
 
     public TableView Table => _table;
+
+    public void ApplySize (SizeClass size, int availableWidth)
+    {
+        bool scaled = ResponsiveWidth.Scaled (size);
+        bool showWho = !scaled;
+
+        // The key stays: ID column and its cell line, the title's cell line, and the "...".
+        int titleWidth = scaled ? ResponsiveWidth.Fit (availableWidth, KeyWidth + 3, MinTitleWidth, TitleWidth) : TitleWidth;
+
+        if (showWho == _showWho && titleWidth == _titleWidth)
+        {
+            return;
+        }
+
+        _showWho = showWho;
+        _titleWidth = titleWidth;
+
+        Show (_issues);
+    }
 
     private async Task LoadAsync ()
     {
@@ -1954,9 +2374,8 @@ internal sealed class LinearWidget : View
              Cap (
                   Wire.Str (issue, "creator", "name") is { Length: > 0 } name ? name : "unknown",
                   WhoWidth),
-             Cap (
-                  Wire.Str (issue, "title") is { Length: > 0 } title ? title : "(no title)",
-                  TitleWidth),
+             // Kept whole: Show cuts it at full size and wraps it when scaled.
+             Wire.Str (issue, "title") is { Length: > 0 } title ? title : "(no title)",
              Wire.Str (issue, "url") ?? "");
 
     private static string Cap (string text, int max) =>
@@ -1966,7 +2385,7 @@ internal sealed class LinearWidget : View
 
     private void Open ()
     {
-        int row = _table.Value?.SelectedCell.Y ?? -1;
+        int row = TableWrap.ItemAt (_display, _table.Value?.SelectedCell.Y ?? -1);
 
         if (row < 0 || row >= _issues.Count)
         {
@@ -1996,14 +2415,34 @@ internal sealed class LinearWidget : View
         {
             _issues = rows;
 
-            ITableSource source = new EnumerableTableSource<LinearIssue> (
-                                                                          rows,
-                                                                          new Dictionary<string, Func<LinearIssue, object>>
-                                                                          {
-                                                                              ["ID"] = i => i.Key,
-                                                                              ["Who"] = i => i.Who,
-                                                                              ["Title"] = i => i.Title
-                                                                          });
+            // Scaled: titles wrap onto extra rows instead of being cut. Full size: one row each, cut as before.
+            _display = _showWho
+                           ? rows.Select ((i, n) => new WrapRow<LinearIssue> (i, n, ResponsiveWidth.Cap (i.Title, _titleWidth), true)).ToList ()
+                           : TableWrap.Expand (rows, i => i.Title, _titleWidth);
+
+            Dictionary<string, Func<WrapRow<LinearIssue>, object>> columns = new () { ["ID"] = r => r.First ? r.Item.Key : "" };
+
+            if (_showWho)
+            {
+                columns ["Who"] = r => r.First ? r.Item.Who : "";
+            }
+
+            columns ["Title"] = r => r.Text;
+
+            ITableSource source = new EnumerableTableSource<WrapRow<LinearIssue>> (_display, columns);
+
+            // Column styles go by index, and dropping Who moves Title up one.
+            _table.Style.ColumnStyles.Clear ();
+            _table.Style.GetOrCreateColumnStyle (0).MaxWidth = KeyWidth;
+
+            int styled = 1;
+
+            if (_showWho)
+            {
+                _table.Style.GetOrCreateColumnStyle (styled++).MaxWidth = WhoWidth;
+            }
+
+            _table.Style.GetOrCreateColumnStyle (styled).MaxWidth = _titleWidth;
 
             _table.SetSource (source);
 
@@ -2022,7 +2461,7 @@ internal sealed class LinearWidget : View
                         + 1;
             }
 
-            _table.Width = Math.Max (1, wide);
+            _table.FitWidth (wide);
             _table.Refresh ();
 
             this.Remeasure ();
@@ -2397,7 +2836,7 @@ internal sealed class SessionsWidget : View
             width += Math.Min (Math.Max (header.Length, longest), _table.Style.GetOrCreateColumnStyle (index++).MaxWidth);
         }
 
-        _table.Width = width;
+        _table.FitWidth (width);
         _table.Refresh ();
         this.Remeasure ();
         this.ResizeLayout ();
@@ -4081,7 +4520,7 @@ internal sealed class GitHistoryWidget : View
                 wide += Math.Min (Math.Max (header.Length, longest), _table.Style.GetOrCreateColumnStyle (index++).MaxWidth);
             }
 
-            _table.Width = wide;
+            _table.FitWidth (wide);
 
             _table.Height = rows.Count + 3;
             _table.Refresh ();
@@ -4344,7 +4783,7 @@ internal class FileHistoryWidget : View
             wide += Math.Min (Math.Max (header.Length, longest), _table.Style.GetOrCreateColumnStyle (index++).MaxWidth);
         }
 
-        _table.Width = wide;
+        _table.FitWidth (wide);
 
         _table.Height = rows.Count + 3;
         _table.Refresh ();
@@ -4603,7 +5042,7 @@ internal sealed class NotesWidget : View
             wide += Math.Min (Math.Max (header.Length, longest), _table.Style.GetOrCreateColumnStyle (index++).MaxWidth);
         }
 
-        _table.Width = wide;
+        _table.FitWidth (wide);
 
         _table.Height = rows.Count + 3;
         _table.Refresh ();

@@ -2,6 +2,7 @@
 //  Data sync: replicates the total-manager folder through a git remote.
 // -----------------------------------------------------------------------------
 
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
@@ -197,6 +198,17 @@ internal sealed record SyncRemote (RemoteKind Kind, string Url, string Scheme, s
         return new (kind, clean.Uri.ToString (), scheme, uri.Host) { Stripped = true };
     }
 }
+
+/// <summary>Which side moved a file since this folder and the remote last agreed.</summary>
+internal enum SyncSide
+{
+    Remote,
+    Both,
+    Local
+}
+
+/// <summary>One file that differs between this folder and the remote.</summary>
+internal sealed record SyncChange (string Path, SyncSide Side, bool OnRemote, bool OnLocal);
 
 /// <summary>
 ///     Replicates the total-manager folder through a git remote, in one direction at a time.
@@ -463,8 +475,15 @@ internal static class DataSync
         return true;
     }
 
-    /// <summary>Makes the remote match the folder, discarding whatever was there.</summary>
-    public static async Task<bool> UpdateAsync (SyncRemote remote, GitCredential? credential, Action<string> log)
+    /// <summary>
+    ///     Makes the remote match the folder. A manual Update force-pushes, discarding whatever
+    ///     was there; an automatic one does not, so it can never overwrite another machine's work.
+    /// </summary>
+    public static async Task<bool> UpdateAsync (
+        SyncRemote remote,
+        GitCredential? credential,
+        Action<string> log,
+        bool force = true)
     {
         if (!await PrepareAsync (remote, log))
         {
@@ -498,9 +517,25 @@ internal static class DataSync
             log ("[sync] nothing changed locally - pushing the current commit anyway");
         }
 
-        if ((await GitAsync (["push", "--force", remote.Url, $"HEAD:{Branch ()}"], remote, credential, log)).Code != 0)
+        string[] push = force
+                            ? ["push", "--force", remote.Url, $"HEAD:{Branch ()}"]
+                            : ["push", remote.Url, $"HEAD:{Branch ()}"];
+
+        (int pushCode, string pushOutput) = await GitAsync (push, remote, credential, log);
+
+        if (pushCode != 0)
         {
-            Error = $"could not push to {Branch ()} on the remote";
+            bool rejected = pushOutput.Contains ("non-fast-forward", StringComparison.OrdinalIgnoreCase)
+                            || pushOutput.Contains ("fetch first", StringComparison.OrdinalIgnoreCase)
+                            || pushOutput.Contains ("Updates were rejected", StringComparison.OrdinalIgnoreCase);
+
+            Error = force
+                        ? $"could not push to {Branch ()} on the remote"
+                        : Unauthorized (pushOutput)
+                            ? $"could not sign in to {remote.Host}"
+                            : rejected
+                                ? $"the remote moved; run Update manually to overwrite it"
+                                : $"could not push to {Branch ()}";
 
             return false;
         }
@@ -636,6 +671,257 @@ internal static class DataSync
                    + $"{NotesSync.Restored} restored, {NotesSync.Deleted} marked deleted");
     }
 
+    /// <summary>Commits on the remote that this folder has not taken, as of the last fetch.</summary>
+    public static int Behind { get; private set; }
+
+    /// <summary>The newest remote commit as "date  subject", as of the last fetch.</summary>
+    public static string Newest { get; private set; } = "";
+
+    private static readonly Action<string> Quiet = _ => { };
+
+    /// <summary>
+    ///     Fetches the remote branch and counts the commits on it that this folder has not taken.
+    ///     Download, Update and Review all leave HEAD containing what the remote had, so any
+    ///     remote commit outside HEAD arrived after this machine last synced.
+    /// </summary>
+    public static async Task<bool> FetchAsync (SyncRemote remote, GitCredential? credential, Action<string> log)
+    {
+        Behind = 0;
+        Newest = "";
+
+        if (!await PrepareAsync (remote, log))
+        {
+            return false;
+        }
+
+        (int code, string output) = await GitAsync (["fetch", remote.Url, Branch ()], remote, credential, log);
+
+        // A remote that has never been pushed to has nothing to be behind.
+        if (code != 0 && output.Contains ("find remote ref", StringComparison.OrdinalIgnoreCase))
+        {
+            log ($"[sync] the remote has no {Branch ()} branch yet");
+
+            return true;
+        }
+
+        if (code != 0)
+        {
+            Error = $"could not fetch {Branch ()} from the remote";
+
+            return false;
+        }
+
+        // A folder that has never synced has an unborn HEAD, and is behind by everything.
+        string range = await HasHeadAsync (remote) ? "HEAD..FETCH_HEAD" : "FETCH_HEAD";
+
+        (code, output) = await GitAsync (["rev-list", "--count", range], remote, null, Quiet);
+        Behind = code == 0 && int.TryParse (output.Trim (), out int count) ? count : 0;
+
+        if (Behind > 0)
+        {
+            Newest = (await GitAsync (
+                                      ["log", "-1", "--format=%cd  %s", "--date=format:%Y-%m-%d %H:%M", "FETCH_HEAD"],
+                                      remote,
+                                      null,
+                                      Quiet)).Output.Trim ();
+        }
+
+        log (Behind == 0 ? "[sync] up to date with the remote" : $"[sync] {Behind} new commit(s) on the remote");
+
+        return true;
+    }
+
+    private static async Task<bool> HasHeadAsync (SyncRemote remote) =>
+        (await GitAsync (["rev-parse", "--verify", "--quiet", "HEAD"], remote, null, Quiet)).Code == 0;
+
+    /// <summary>
+    ///     Every file where this folder and the last fetched remote differ, and which side moved
+    ///     since the two last agreed. Stages the folder to do it - harmless, since Update stages
+    ///     everything anyway and Download and Review rewrite the index.
+    /// </summary>
+    public static async Task<List<SyncChange>?> ChangesAsync (SyncRemote remote, Action<string> log)
+    {
+        Error = null;
+
+        Checkpoint (log);
+
+        if ((await GitAsync (["add", "-A"], remote, null, log)).Code != 0)
+        {
+            Error = "could not stage the folder to compare it";
+
+            return null;
+        }
+
+        (int code, string output) = await GitAsync (
+                                                   ["diff", "--cached", "--name-status", "--no-renames", "-z", "FETCH_HEAD"],
+                                                   remote,
+                                                   null,
+                                                   Quiet);
+
+        if (code != 0)
+        {
+            Error = "could not compare the folder with the remote";
+
+            return null;
+        }
+
+        // The last commit both sides share. None means the histories are unrelated - a folder
+        // that was in use before its first sync - so every difference counts as changed on both.
+        (int baseCode, string baseOutput) = await GitAsync (["merge-base", "HEAD", "FETCH_HEAD"], remote, null, Quiet);
+        string? common = baseCode == 0 ? baseOutput.Trim () : null;
+
+        HashSet<string>? movedHere = common is null
+                                         ? null
+                                         : await NamesAsync (["diff", "--cached", "--name-only", "--no-renames", "-z", common], remote);
+
+        HashSet<string>? movedThere = common is null
+                                          ? null
+                                          : await NamesAsync (["diff", "--name-only", "--no-renames", "-z", common, "FETCH_HEAD"], remote);
+
+        List<SyncChange> changes = new ();
+        string[] fields = output.TrimEnd ('\r', '\n').Split ('\0', StringSplitOptions.RemoveEmptyEntries);
+
+        // -z --name-status alternates status and path.
+        for (int i = 0; i + 1 < fields.Length; i += 2)
+        {
+            string status = fields [i].Trim ();
+            string path = fields [i + 1];
+
+            bool here = movedHere?.Contains (path) ?? true;
+            bool there = movedThere?.Contains (path) ?? true;
+
+            SyncSide side = here == there ? SyncSide.Both
+                            : there ? SyncSide.Remote
+                            : SyncSide.Local;
+
+            // The diff runs remote -> this folder: A is only here, D is only on the remote.
+            changes.Add (new SyncChange (path, side, OnRemote: status != "A", OnLocal: status != "D"));
+        }
+
+        log ($"[sync] {changes.Count} file(s) differ from the remote");
+
+        return changes.OrderBy (c => c.Side).ThenBy (c => c.Path, StringComparer.OrdinalIgnoreCase).ToList ();
+    }
+
+    private static async Task<HashSet<string>?> NamesAsync (string[] arguments, SyncRemote remote)
+    {
+        (int code, string output) = await GitAsync (arguments, remote, null, Quiet);
+
+        return code != 0
+                   ? null
+                   : output.TrimEnd ('\r', '\n').Split ('\0', StringSplitOptions.RemoveEmptyEntries).ToHashSet ();
+    }
+
+    /// <summary>The diff for one file, written as what taking the remote copy would do to yours.</summary>
+    public static async Task<string> DiffAsync (SyncRemote remote, string path)
+    {
+        (int code, string output) = await GitAsync (
+                                                   ["--literal-pathspecs", "diff", "--cached", "--no-color", "-R", "FETCH_HEAD", "--", path],
+                                                   remote,
+                                                   null,
+                                                   Quiet);
+
+        return code != 0 ? "(could not diff this file)" : output.Length == 0 ? "(no textual difference)" : output;
+    }
+
+    /// <summary>
+    ///     Takes the chosen files from the remote and keeps this folder's copy of the rest, then
+    ///     records a merge commit with both histories as parents - so the remote no longer counts
+    ///     as ahead, and the next Update publishes the result without losing anything.
+    /// </summary>
+    public static async Task<bool> ApplyAsync (SyncRemote remote, IReadOnlyList<SyncChange> take, Action<string> log)
+    {
+        Error = null;
+
+        // Pooled handles hold the database file open, and it may be replaced below.
+        SqliteConnection.ClearAllPools ();
+
+        if (take.Count > 0 && Backup (log) is null)
+        {
+            Error = "could not take a backup, so nothing was overwritten";
+
+            return false;
+        }
+
+        bool database = false;
+
+        foreach (SyncChange change in take)
+        {
+            string full = Path.GetFullPath (Path.Combine (UserSettings.FolderPath, change.Path));
+
+            database |= string.Equals (full, Path.GetFullPath (Engine.FilePath), StringComparison.OrdinalIgnoreCase);
+
+            if (change.OnRemote)
+            {
+                if ((await GitAsync (["--literal-pathspecs", "checkout", "FETCH_HEAD", "--", change.Path], remote, null, log)).Code != 0)
+                {
+                    Error = $"could not take {change.Path} from the remote";
+
+                    return false;
+                }
+
+                continue;
+            }
+
+            try
+            {
+                File.Delete (full);
+                log ($"[sync] removed {change.Path} - the remote does not have it");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Error = $"could not remove {change.Path}: {ex.Message}";
+
+                return false;
+            }
+        }
+
+        if (database)
+        {
+            DropStaleSidecars (log);
+        }
+
+        await GitAsync (["add", "-A"], remote, null, log);
+
+        (int code, string tree) = await GitAsync (["write-tree"], remote, null, log);
+
+        if (code != 0)
+        {
+            Error = "could not record the result";
+
+            return false;
+        }
+
+        List<string> commit = new ()
+        {
+            "-c", "user.name=ttm", "-c", "user.email=ttm@localhost",
+            "commit-tree", tree.Trim (),
+            "-m", $"ttm review {DateTime.Now:yyyy-MM-dd HH:mm:ss} on {Environment.MachineName}: "
+                  + $"{take.Count} file(s) taken from the remote"
+        };
+
+        if (await HasHeadAsync (remote))
+        {
+            commit.AddRange (["-p", "HEAD"]);
+        }
+
+        commit.AddRange (["-p", "FETCH_HEAD"]);
+
+        (code, string sha) = await GitAsync (commit.ToArray (), remote, null, log);
+
+        if (code != 0 || (await GitAsync (["update-ref", "HEAD", sha.Trim ()], remote, null, log)).Code != 0)
+        {
+            Error = "could not record the result";
+
+            return false;
+        }
+
+        Behind = 0;
+        Reopen (log);
+
+        return true;
+    }
+
     /// <summary>The stored credential for this remote, or null when none is stored yet.</summary>
     public static GitCredential? Credential (SyncRemote remote, AuthKey key) =>
         AuthStore.Get (remote.AuthId, key) is { } json ? GitCredential.FromJson (json) : null;
@@ -665,13 +951,120 @@ internal static class DataSync
 /// </summary>
 internal static class SyncRunner
 {
+    private static int _busy;
+
+    /// <summary>True while a manual or automatic sync owns the folder.</summary>
+    public static bool Busy => Volatile.Read (ref _busy) != 0;
+
+    /// <summary>Claims the sync gate; false when another flow already holds it.</summary>
+    internal static bool TryBegin () => Interlocked.CompareExchange (ref _busy, 1, 0) == 0;
+
+    internal static void End () => Volatile.Write (ref _busy, 0);
+
     public static void Download (View owner) => Run (owner, download: true);
 
     public static void Update (View owner) => Run (owner, download: false);
 
     private static void Run (View owner, bool download)
     {
-        SyncRemote remote = DataSync.Remote ();
+        if (!TryBegin ())
+        {
+            MessageBox.Query (
+                              owner.App!,
+                              "Sync already running",
+                              "Wait for the current sync to finish.",
+                              new [] { "_Ok" });
+
+            return;
+        }
+
+        AuthKey? key = null;
+
+        try
+        {
+            SyncRemote remote = DataSync.Remote ();
+
+            if (!Unlock (owner, remote, out key, out GitCredential? credential))
+            {
+                return;
+            }
+
+            // Update force-pushes, so a remote that moved on since this machine last synced is
+            // checked for first - otherwise those commits are lost without anyone seeing them.
+            if (!download)
+            {
+                (bool fetched, _) = Progress (owner, "Check for updates", w => DataSync.FetchAsync (remote, credential, w), closeOnSuccess: true);
+
+                if (fetched && DataSync.Behind > 0)
+                {
+                    int choice = MessageBox.Query (
+                                                   owner.App!,
+                                                   "The remote has newer changes",
+                                                   Behind ()
+                                                   + Environment.NewLine
+                                                   + Environment.NewLine
+                                                   + "Updating now overwrites them. Review takes what you"
+                                                   + Environment.NewLine
+                                                   + "want from the remote first, file by file.",
+                                                   new [] { "_Cancel", "_Overwrite anyway", "_Review changes" })
+                                 ?? 0;
+
+                    if (choice == 2)
+                    {
+                        Review (owner, remote, credential, fetched: true);
+
+                        return;
+                    }
+
+                    if (choice != 1)
+                    {
+                        return;
+                    }
+                }
+            }
+
+            if (!Confirm (owner, remote, download))
+            {
+                return;
+            }
+
+            (bool ok, string output) = Progress (owner, download ? "Download" : "Update", w => Sync (remote, credential, download, w));
+
+            // A rejected token is worth one more go, with a chance to replace it in place.
+            if (!ok && remote.NeedsAuth && DataSync.Unauthorized (output))
+            {
+                // The remembered copy is the one that failed, so stop using it.
+                DeviceCredential.Remove (remote.AuthId);
+
+                // A remembered credential skipped the passphrase; storing a replacement needs it.
+                if (Retry (owner, remote)
+                    && (key ??= AuthPrompt.Unlock (owner)) is not null
+                    && Ask (owner, remote, key!, credential?.User ?? "") is { } replaced)
+                {
+                    (ok, output) = Progress (owner, download ? "Download" : "Update", w => Sync (remote, replaced, download, w));
+                }
+            }
+
+            Report (owner, download, ok);
+        }
+        finally
+        {
+            key?.Dispose ();
+            End ();
+        }
+    }
+
+    private static Task<bool> Sync (SyncRemote remote, GitCredential? credential, bool download, Action<string> log) =>
+        download ? DataSync.DownloadAsync (remote, credential, log) : DataSync.UpdateAsync (remote, credential, log);
+
+    /// <summary>
+    ///     Gets the credential for the remote, walking a new machine through the passphrase and the
+    ///     token. False when there is no remote or the user backed out. The caller disposes the key.
+    /// </summary>
+    private static bool Unlock (View owner, SyncRemote remote, out AuthKey? key, out GitCredential? credential)
+    {
+        key = null;
+        credential = null;
 
         if (remote.Kind == RemoteKind.Unset)
         {
@@ -681,6 +1074,148 @@ internal static class SyncRunner
                                    "Set a repository URL in Settings > User first.",
                                    new [] { "_Ok" });
 
+            return false;
+        }
+
+        // ssh rides the keys the user already has, and a local path has nothing to sign in
+        // to, so neither asks for a passphrase at all.
+        if (!remote.NeedsAuth)
+        {
+            return true;
+        }
+
+        // Remembered on this PC by an earlier unlock, so no passphrase. A freshly pasted token
+        // skips it - replacing the remembered one is the reason it was pasted.
+        if (!PendingCredential.Holds (remote.AuthId)
+            && DeviceCredential.Get (remote.AuthId) is { } remembered
+            && GitCredential.FromJson (remembered) is { } cached)
+        {
+            credential = cached;
+
+            return true;
+        }
+
+        key = AuthPrompt.Unlock (owner);
+
+        if (key is null)
+        {
+            return false;
+        }
+
+        credential = DataSync.Credential (remote, key);
+
+        // A token pasted into the repo URL is committed to the store here, where the
+        // passphrase is finally available - so it is never asked for twice. A freshly
+        // pasted one wins over whatever was stored, since supplying a new token is how
+        // you replace an expired one.
+        if (PendingCredential.Take (remote.AuthId) is { } pasted)
+        {
+            if (!AuthStore.Set (remote.AuthId, pasted.ToJson (), key))
+            {
+                MessageBox.ErrorQuery (
+                                       owner.App!,
+                                       "Cannot store",
+                                       AuthStore.Error ?? "could not write the credentials file",
+                                       new [] { "_Ok" });
+
+                return false;
+            }
+
+            credential = pasted;
+        }
+
+        credential ??= Ask (owner, remote, key, "");
+
+        if (credential is null)
+        {
+            return false;
+        }
+
+        DeviceCredential.Set (remote.AuthId, credential.ToJson ());
+
+        return true;
+    }
+
+    private static string Behind () =>
+        $"{DataSync.Behind} commit(s) on the remote are not on this machine."
+        + (DataSync.Newest.Length == 0 ? "" : Environment.NewLine + "Newest: " + DataSync.Newest);
+
+    /// <summary>
+    ///     Checks the remote once at launch, and offers a review if it has moved on. Uses the
+    ///     credential remembered on this PC, so it never prompts; with none remembered yet it
+    ///     tries without a token, which works for a public repository and fails quietly for a
+    ///     private one until the first sync on this PC has been unlocked.
+    /// </summary>
+    public static void CheckOnLaunch (View owner)
+    {
+        SyncRemote remote = DataSync.Remote ();
+
+        if (remote.Kind == RemoteKind.Unset)
+        {
+            return;
+        }
+
+        GitCredential? credential = remote.NeedsAuth && DeviceCredential.Get (remote.AuthId) is { } json
+                                        ? GitCredential.FromJson (json)
+                                        : null;
+
+        _ = Task.Run (async () =>
+                      {
+                          if (!TryBegin ())
+                          {
+                              return;
+                          }
+
+                          bool behind;
+
+                          try
+                          {
+                              behind = await DataSync.FetchAsync (remote, credential, _ => { }) && DataSync.Behind > 0;
+                          }
+                          finally
+                          {
+                              End ();
+                          }
+
+                          if (!behind)
+                          {
+                              return;
+                          }
+
+                          owner.App?.Invoke (() =>
+                                             {
+                                                 if (MessageBox.Query (
+                                                                       owner.App!,
+                                                                       "Updates on the remote",
+                                                                       Behind (),
+                                                                       new [] { "_Later", "_Review" })
+                                                     == 1
+                                                     && TryBegin ())
+                                                 {
+                                                     try
+                                                     {
+                                                         Review (owner, remote, credential, fetched: true);
+                                                     }
+                                                     finally
+                                                     {
+                                                         End ();
+                                                     }
+                                                 }
+                                             });
+                      });
+    }
+
+    /// <summary>Fetches, then lets the user pick file by file what to take from the remote.</summary>
+    public static void Review (View owner)
+    {
+        if (!TryBegin ())
+        {
+            MessageBox.Query (
+                              owner.App!,
+                              "Sync already running",
+                              "Wait for the current sync to finish.",
+                              new [] { "_Ok" });
+
             return;
         }
 
@@ -688,73 +1223,78 @@ internal static class SyncRunner
 
         try
         {
-            GitCredential? credential = null;
+            SyncRemote remote = DataSync.Remote ();
 
-            // ssh rides the keys the user already has, and a local path has nothing to sign in
-            // to, so neither asks for a passphrase at all.
-            if (remote.NeedsAuth)
+            if (Unlock (owner, remote, out key, out GitCredential? credential))
             {
-                key = AuthPrompt.Unlock (owner);
-
-                if (key is null)
-                {
-                    return;
-                }
-
-                credential = DataSync.Credential (remote, key);
-
-                // A token pasted into the repo URL is committed to the store here, where the
-                // passphrase is finally available - so it is never asked for twice. A freshly
-                // pasted one wins over whatever was stored, since supplying a new token is how
-                // you replace an expired one.
-                if (PendingCredential.Take (remote.AuthId) is { } pasted)
-                {
-                    if (!AuthStore.Set (remote.AuthId, pasted.ToJson (), key))
-                    {
-                        MessageBox.ErrorQuery (
-                                               owner.App!,
-                                               "Cannot store",
-                                               AuthStore.Error ?? "could not write the credentials file",
-                                               new [] { "_Ok" });
-
-                        return;
-                    }
-
-                    credential = pasted;
-                }
-
-                if (credential is null)
-                {
-                    if (Ask (owner, remote, key, "") is not { } entered)
-                    {
-                        return;
-                    }
-
-                    credential = entered;
-                }
+                Review (owner, remote, credential, fetched: false);
             }
-
-            if (!Confirm (owner, remote, download))
-            {
-                return;
-            }
-
-            (bool ok, string output) = Progress (owner, remote, credential, download);
-
-            // A rejected token is worth one more go, with a chance to replace it in place.
-            if (!ok && key is not null && remote.NeedsAuth && DataSync.Unauthorized (output))
-            {
-                if (Retry (owner, remote) && Ask (owner, remote, key, credential?.User ?? "") is { } replaced)
-                {
-                    (ok, output) = Progress (owner, remote, replaced, download);
-                }
-            }
-
-            Report (owner, download, ok);
         }
         finally
         {
             key?.Dispose ();
+            End ();
+        }
+    }
+
+    private static void Review (View owner, SyncRemote remote, GitCredential? credential, bool fetched)
+    {
+        List<SyncChange>? changes = null;
+
+        (bool ok, _) = Progress (
+                                 owner,
+                                 "Check for updates",
+                                 async w =>
+                                 {
+                                     if (!fetched && !await DataSync.FetchAsync (remote, credential, w))
+                                     {
+                                         return false;
+                                     }
+
+                                     changes = await DataSync.ChangesAsync (remote, w);
+
+                                     return changes is not null;
+                                 },
+                                 closeOnSuccess: true);
+
+        if (!ok || changes is null)
+        {
+            return;
+        }
+
+        if (changes.Count == 0)
+        {
+            // New commits that change no file here still count as taken, or the warning would
+            // come back on every launch.
+            if (DataSync.Behind > 0)
+            {
+                Progress (owner, "Review", w => DataSync.ApplyAsync (remote, [], w), closeOnSuccess: true);
+            }
+
+            MessageBox.Query (owner.App!, "Up to date", "No file differs from the remote.", new [] { "_Ok" });
+
+            return;
+        }
+
+        if (SyncReview.Pick (owner, changes) is not { } take)
+        {
+            return;
+        }
+
+        (ok, _) = Progress (owner, "Review", w => DataSync.ApplyAsync (remote, take, w));
+
+        if (ok)
+        {
+            MessageBox.Query (
+                              owner.App!,
+                              "Review finished",
+                              $"{take.Count} file(s) taken from the remote, {changes.Count - take.Count} of yours kept."
+                              + Environment.NewLine
+                              + Environment.NewLine
+                              + "Press Update to publish the result. Tabs that are already open"
+                              + Environment.NewLine
+                              + "still show what was loaded before - restart ttm to see everything.",
+                              new [] { "_Ok" });
         }
     }
 
@@ -771,7 +1311,8 @@ internal static class SyncRunner
         if (AuthPrompt.AskCredential (
                                       owner,
                                       "Sign in to " + remote.Host,
-                                      $"{warning}\nIt is encrypted with your passphrase and kept out of the synced folder.",
+                                      $"{warning}\nIt is encrypted with your passphrase and kept out of the synced folder,\n"
+                                      + "and remembered for your Windows account so this PC does not ask again.",
                                       "Username",
                                       "Token",
                                       user) is not { } entered)
@@ -791,6 +1332,8 @@ internal static class SyncRunner
 
             return null;
         }
+
+        DeviceCredential.Set (remote.AuthId, credential.ToJson ());
 
         return credential;
     }
@@ -844,11 +1387,15 @@ internal static class SyncRunner
     ///     Runs the operation behind a live log, so a stall is visible as the git command it is
     ///     stuck on rather than a frozen window. Close only becomes available once it has finished.
     /// </summary>
-    private static (bool Ok, string Output) Progress (View owner, SyncRemote remote, GitCredential? credential, bool download)
+    private static (bool Ok, string Output) Progress (
+        View owner,
+        string title,
+        Func<Action<string>, Task<bool>> work,
+        bool closeOnSuccess = false)
     {
         Dialog dialog = new ()
         {
-            Title = download ? "Download" : "Update",
+            Title = title,
             Width = Dim.Percent (85),
             Height = Dim.Percent (80)
         };
@@ -874,9 +1421,7 @@ internal static class SyncRunner
 
         async Task RunAsync ()
         {
-            bool result = download
-                              ? await DataSync.DownloadAsync (remote, credential, Write)
-                              : await DataSync.UpdateAsync (remote, credential, Write);
+            bool result = await work (Write);
 
             owner.App?.Invoke (() =>
                                {
@@ -884,8 +1429,16 @@ internal static class SyncRunner
 
                                    Write ("");
                                    Write (result
-                                              ? download ? "Download finished." : "Update finished."
+                                              ? title + " finished."
                                               : "FAILED: " + (DataSync.Error ?? "see the output above"));
+
+                                   // A quick check that worked has nothing worth reading; a failure stays up.
+                                   if (result && closeOnSuccess)
+                                   {
+                                       owner.App?.RequestStop (dialog);
+
+                                       return;
+                                   }
 
                                    close.Enabled = true;
                                    close.SetFocus ();
@@ -920,5 +1473,343 @@ internal static class SyncRunner
                               + "download. Restart ttm to see everything."
                               : "The remote now matches this folder.",
                           new [] { "_Ok" });
+    }
+}
+
+/// <summary>
+///     The file-by-file picker behind Review: every file that differs from the remote on the
+///     left, the diff of the highlighted one on the right. A ticked file is taken from the
+///     remote, an unticked one keeps this machine's copy. Files only the remote changed start
+///     ticked, everything else starts as yours - so accepting the defaults loses nothing.
+/// </summary>
+internal static class SyncReview
+{
+    public static List<SyncChange>? Pick (View owner, List<SyncChange> changes)
+    {
+        SyncRemote remote = DataSync.Remote ();
+
+        Dialog dialog = new ()
+        {
+            Title = $"Review - {changes.Count} file(s) differ from the remote",
+            Width = Dim.Percent (90),
+            Height = Dim.Percent (85)
+        };
+
+        Label help = new ()
+        {
+            Text = "Space ticks a file: ticked = take the remote copy, unticked = keep yours.   Diff: - yours  + remote",
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill (),
+            Height = 1
+        };
+
+        ListView list = new ()
+        {
+            X = 0,
+            Y = 2,
+            Width = Dim.Percent (40),
+            Height = Dim.Fill (2),
+            ShowMarks = true,
+            MarkMultiple = true
+        };
+
+        list.SetSource (new ObservableCollection<string> (changes.Select (Describe)));
+
+        for (int i = 0; i < changes.Count; i++)
+        {
+            list.Source!.SetMark (i, changes [i].Side == SyncSide.Remote);
+        }
+
+        Editor diff = new ()
+        {
+            X = Pos.Right (list) + 1,
+            Y = 2,
+            Width = Dim.Fill (),
+            Height = Dim.Fill (2),
+            ReadOnly = true
+        };
+
+        Button allRemote = new () { Text = "Take all _remote", X = 0, Y = Pos.Bottom (list) };
+        Button allMine = new () { Text = "_Keep all mine", X = Pos.Right (allRemote) + 1, Y = Pos.Top (allRemote) };
+
+        allRemote.Accepted += (_, _) => Mark (list, true);
+        allMine.Accepted += (_, _) => Mark (list, false);
+
+        // The diff loads off the UI thread; a slow one for a row already left is dropped.
+        int? shown = null;
+
+        void Show (int? row)
+        {
+            shown = row;
+
+            if (row is not { } index || index < 0 || index >= changes.Count)
+            {
+                diff.Text = "";
+
+                return;
+            }
+
+            diff.Text = "loading...";
+
+            _ = Task.Run (async () =>
+                          {
+                              string text = await DataSync.DiffAsync (remote, changes [index].Path);
+
+                              owner.App?.Invoke (() =>
+                                                 {
+                                                     if (shown == index)
+                                                     {
+                                                         diff.Text = text;
+                                                     }
+                                                 });
+                          });
+        }
+
+        list.ValueChanged += (_, e) => Show (e.NewValue);
+
+        // Cancel, Apply: the last button is the default, so Enter applies the ticks.
+        Button cancel = new () { Text = "_Cancel" };
+        Button apply = new () { Text = "_Apply" };
+
+        bool applied = false;
+
+        cancel.Accepted += (_, _) => owner.App!.RequestStop (dialog);
+
+        apply.Accepted += (_, _) =>
+        {
+            applied = true;
+            owner.App!.RequestStop (dialog);
+        };
+
+        dialog.Add (help, list, diff, allRemote, allMine);
+        dialog.AddButton (cancel);
+        dialog.AddButton (apply);
+
+        dialog.Initialized += (_, _) =>
+        {
+            list.SelectedItem = 0;
+            Show (0);
+            list.SetFocus ();
+        };
+
+        owner.App!.Run (dialog);
+
+        List<SyncChange> take = changes.Where ((_, i) => list.Source!.IsMarked (i)).ToList ();
+
+        dialog.Dispose ();
+
+        return applied ? take : null;
+    }
+
+    private static void Mark (ListView list, bool mark)
+    {
+        for (int i = 0; i < list.Source!.Count; i++)
+        {
+            list.Source.SetMark (i, mark);
+        }
+
+        list.SetNeedsDraw ();
+    }
+
+    private static string Describe (SyncChange change)
+    {
+        string side = change.Side switch
+        {
+            SyncSide.Remote => "remote changed",
+            SyncSide.Local => "you changed   ",
+            _ => "both changed  "
+        };
+
+        string presence = !change.OnLocal ? "  (only on remote)" : !change.OnRemote ? "  (only here)" : "";
+
+        return $"{side}  {change.Path}{presence}";
+    }
+}
+
+/// <summary>
+///     Pushes local changes to the remote on a timer.
+///
+///     Only Update (local to remote) is automatic. Download is destructive and stays a deliberate
+///     button press. An automatic run fetches first and never force-pushes: if another machine has
+///     committed since this one last synced, it stands down and leaves the remote alone.
+///
+///     It also never prompts. The credential has to be the one already remembered for this PC;
+///     until the first manual sync has established one, the timer reports that it is paused.
+/// </summary>
+internal static class AutoSync
+{
+    public const int DefaultMinutes = 5;
+
+    private static View? _owner;
+    private static object? _timer;
+    private static int _scheduled;
+    private static string _status = "auto-update off";
+
+    /// <summary>Raised on the UI loop whenever <see cref="Status"/> changes.</summary>
+    public static event Action? Changed;
+
+    public static string Status => _status;
+
+    /// <summary>The interval in minutes. Zero turns the timer off; anything invalid falls back to 5.</summary>
+    public static int Minutes
+    {
+        get
+        {
+            string raw = UserSettings.Get (UserSettings.SyncAutoMinutes).Trim ();
+
+            return int.TryParse (raw, out int minutes) && minutes >= 0 ? minutes : DefaultMinutes;
+        }
+    }
+
+    public static void Start (View owner)
+    {
+        _owner = owner;
+        owner.Disposing += (_, _) => Stop ();
+        Reschedule ();
+    }
+
+    /// <summary>Applies a changed interval without waiting for the old one to fire.</summary>
+    public static void Reschedule ()
+    {
+        Stop ();
+
+        if (_owner is not { } owner || owner.App is not { } app)
+        {
+            return;
+        }
+
+        int minutes = Minutes;
+        _scheduled = minutes;
+
+        if (minutes == 0)
+        {
+            SetStatus ("auto-update off");
+
+            return;
+        }
+
+        SetStatus ($"auto-update every {minutes} min");
+        _timer = app.AddTimeout (TimeSpan.FromMinutes (minutes), Tick);
+    }
+
+    public static void Stop ()
+    {
+        if (_timer is { } token)
+        {
+            _owner?.App?.RemoveTimeout (token);
+            _timer = null;
+        }
+    }
+
+    private static bool Tick ()
+    {
+        // A settings file edited outside the UI, or a value that changed without Reschedule.
+        if (Minutes != _scheduled)
+        {
+            Reschedule ();
+
+            return false;
+        }
+
+        if (_scheduled == 0)
+        {
+            SetStatus ("auto-update off");
+
+            return false;
+        }
+
+        _ = Task.Run (RunAsync);
+
+        return true;
+    }
+
+    private static async Task RunAsync ()
+    {
+        if (!SyncRunner.TryBegin ())
+        {
+            SetStatus ("auto-update skipped - another sync is running");
+
+            return;
+        }
+
+        try
+        {
+            SyncRemote remote = DataSync.Remote ();
+
+            if (remote.Kind == RemoteKind.Unset)
+            {
+                SetStatus ("auto-update off - no remote");
+
+                return;
+            }
+
+            // Only a credential already remembered for this PC. An auto run must never stop to
+            // ask for a passphrase, because it fires while the user may be doing something else.
+            GitCredential? credential = remote.NeedsAuth && DeviceCredential.Get (remote.AuthId) is { } json
+                                            ? GitCredential.FromJson (json)
+                                            : null;
+
+            if (remote.NeedsAuth && credential is null)
+            {
+                SetStatus (OperatingSystem.IsWindows ()
+                               ? "auto-update paused - press Update once to store a token"
+                               : "auto-update paused - automatic sign-in needs Windows; use ssh or run Update");
+
+                return;
+            }
+
+            SetStatus ("auto-update: checking remote...");
+
+            if (!await DataSync.FetchAsync (remote, credential, _ => { }))
+            {
+                SetStatus ("auto-update failed: " + (DataSync.Error ?? "could not fetch"));
+
+                return;
+            }
+
+            // Update is a force-push. Automatic must never discard commits made elsewhere, so a
+            // remote that moved on stops here and waits for a deliberate Update or Review.
+            if (DataSync.Behind > 0)
+            {
+                SetStatus ($"auto-update skipped - {DataSync.Behind} newer commit(s) on the remote");
+
+                return;
+            }
+
+            SetStatus ("auto-update: pushing...");
+
+            if (!await DataSync.UpdateAsync (remote, credential, _ => { }, force: false))
+            {
+                SetStatus ("auto-update failed: " + (DataSync.Error ?? "could not push"));
+
+                return;
+            }
+
+            SetStatus ($"auto-update pushed {DateTime.Now:HH:mm}");
+        }
+        catch (Exception ex)
+        {
+            SetStatus ("auto-update failed: " + ex.Message);
+        }
+        finally
+        {
+            SyncRunner.End ();
+        }
+    }
+
+    private static void SetStatus (string status)
+    {
+        _status = status;
+
+        try
+        {
+            // The settings page's status label is a view, so marshal the notification onto the
+            // UI loop even when the sync ran on a worker thread.
+            _owner?.App?.Invoke (() => Changed?.Invoke ());
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        {
+        }
     }
 }

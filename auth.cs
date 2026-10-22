@@ -190,8 +190,12 @@ internal static class AuthStore
     ///     Forgotten passphrase: set a new one and destroy every stored credential, because
     ///     without the old passphrase no key exists that can read them.
     /// </summary>
-    public static bool Reset (string passphrase) =>
-        Rebuild (passphrase, new Dictionary<string, string> (StringComparer.Ordinal));
+    public static bool Reset (string passphrase)
+    {
+        DeviceCredential.ClearAll ();
+
+        return Rebuild (passphrase, new Dictionary<string, string> (StringComparer.Ordinal));
+    }
 
     public static string? Get (string id, AuthKey key) =>
         Read () is { } file && file.Auths.TryGetValue (id, out AuthEntry? entry) ? Decrypt (id, entry, key) : null;
@@ -219,13 +223,18 @@ internal static class AuthStore
 
         Dictionary<string, AuthEntry> auths = new (file.Auths, StringComparer.Ordinal);
         auths.Remove (id);
+        DeviceCredential.Remove (id);
 
         return Write (file with { Auths = auths });
     }
 
     /// <summary>Empty every stored credential, keeping the passphrase in place.</summary>
-    public static bool ClearAll () =>
-        Read () is { } file && Write (file with { Auths = new Dictionary<string, AuthEntry> (StringComparer.Ordinal) });
+    public static bool ClearAll ()
+    {
+        DeviceCredential.ClearAll ();
+
+        return Read () is { } file && Write (file with { Auths = new Dictionary<string, AuthEntry> (StringComparer.Ordinal) });
+    }
 
     private static bool Rebuild (string passphrase, Dictionary<string, string> plain)
     {
@@ -354,6 +363,106 @@ internal static class AuthStore
             Error = ex.Message;
 
             return false;
+        }
+    }
+}
+
+/// <summary>
+///     A second copy of each credential, protected by Windows (DPAPI) for the signed-in user
+///     instead of by the passphrase - the same trust level as Git Credential Manager. It is what
+///     lets the launch check and later syncs reach a private remote without asking for the
+///     passphrase every time: the passphrase is typed once per PC, then this copy is used.
+///
+///     Anything running as this Windows user can read it. Forget all, or a rejected token,
+///     removes it. Windows only - elsewhere every call is a no-op and the passphrase is asked.
+/// </summary>
+internal static class DeviceCredential
+{
+    public const string FileName = "device-credentials.json";
+
+    // Ties the blobs to ttm, so another app calling DPAPI for this user cannot decrypt them by
+    // accident.
+    private static readonly byte[] Entropy = Encoding.UTF8.GetBytes ("ttm-device-credential");
+
+    public static string FilePath => Path.Combine (AuthStore.FolderPath, FileName);
+
+    public static string? Get (string id)
+    {
+        if (!OperatingSystem.IsWindows () || !Read ().TryGetValue (id, out string? blob))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Encoding.UTF8.GetString (ProtectedData.Unprotect (Convert.FromBase64String (blob), Entropy, DataProtectionScope.CurrentUser));
+        }
+        catch (Exception ex) when (ex is CryptographicException or FormatException)
+        {
+            // Copied from another account or machine, or damaged: useless here, so drop it.
+            Remove (id);
+
+            return null;
+        }
+    }
+
+    public static void Set (string id, string value)
+    {
+        if (!OperatingSystem.IsWindows ())
+        {
+            return;
+        }
+
+        Dictionary<string, string> all = Read ();
+
+        all [id] = Convert.ToBase64String (ProtectedData.Protect (Encoding.UTF8.GetBytes (value), Entropy, DataProtectionScope.CurrentUser));
+        Write (all);
+    }
+
+    public static void Remove (string id)
+    {
+        Dictionary<string, string> all = Read ();
+
+        if (all.Remove (id))
+        {
+            Write (all);
+        }
+    }
+
+    public static void ClearAll ()
+    {
+        try
+        {
+            File.Delete (FilePath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private static Dictionary<string, string> Read ()
+    {
+        try
+        {
+            return File.Exists (FilePath)
+                       ? JsonSerializer.Deserialize<Dictionary<string, string>> (File.ReadAllText (FilePath)) ?? new ()
+                       : new ();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return new ();
+        }
+    }
+
+    private static void Write (Dictionary<string, string> all)
+    {
+        try
+        {
+            Directory.CreateDirectory (AuthStore.FolderPath);
+            File.WriteAllText (FilePath, JsonSerializer.Serialize (all));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
         }
     }
 }

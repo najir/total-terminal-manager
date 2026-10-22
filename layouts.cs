@@ -26,26 +26,41 @@ internal static class Layouts
     }
 }
 
-/// <summary>A container that keeps its widgets in one direction and equalises them across the other.</summary>
+/// <summary>
+///     A container that keeps its widgets in one direction and equalises them across the other.
+///     <see cref="Reflow"/> lets a horizontal container stack its widgets when space runs out.
+/// </summary>
 internal sealed class LayoutView : View
 {
     private const string Expanded = ">";
 
     private const string Shrunk = "|";
 
-    private readonly bool _horizontal;
+    private readonly bool _preferHorizontal;
+    private readonly Dim _width;
     private readonly int _gap;
 
-    private readonly Dictionary<View, Dim?> _natural = new ();
+    private bool _horizontal;
+
+    // Children in the order they were placed, so they can be re-placed after a reflow.
+    private readonly List<View> _order = new ();
+
+    // Each child's own size, captured at Place() so either axis can be restored.
+    private readonly Dictionary<View, Dim> _naturalWidth = new ();
+    private readonly Dictionary<View, Dim> _naturalHeight = new ();
+
+    // Each child's width while laid out side by side; used to tell whether the row still fits.
+    private readonly Dictionary<View, int> _sideBySideWidth = new ();
 
     private readonly Dictionary<View, int> _measured = new ();
 
-    private View? _previous;
     private bool _busy;
 
     public LayoutView (bool horizontal, Dim width, int gap)
     {
+        _preferHorizontal = horizontal;
         _horizontal = horizontal;
+        _width = width;
         _gap = gap;
 
         Width = width;
@@ -60,13 +75,16 @@ internal sealed class LayoutView : View
 
     public void Place (View widget)
     {
-        widget.X = _horizontal && _previous is not null ? Pos.Right (_previous) + _gap : 0;
-        widget.Y = _horizontal || _previous is null ? 0 : Pos.Bottom (_previous) + _gap;
+        View? previous = _order.LastOrDefault ();
 
-        _natural [widget] = _horizontal ? widget.Height : widget.Width;
+        widget.X = _horizontal && previous is not null ? Pos.Right (previous) + _gap : 0;
+        widget.Y = _horizontal || previous is null ? 0 : Pos.Bottom (previous) + _gap;
+
+        _naturalWidth [widget] = widget.Width;
+        _naturalHeight [widget] = widget.Height;
 
         Add (widget);
-        _previous = widget;
+        _order.Add (widget);
     }
 
     public void Resize ()
@@ -77,6 +95,79 @@ internal sealed class LayoutView : View
 
         (SuperView as LayoutView)?.Resize ();
     }
+
+    /// <summary>
+    ///     Picks the direction for the given tier and width: a horizontal container stacks when
+    ///     the tier is Compact or smaller, or when its widgets no longer fit side by side.
+    ///     Nested containers are reflowed against the width they get. Returns true if anything moved.
+    /// </summary>
+    public bool Reflow (SizeClass size, int available)
+    {
+        if (_horizontal)
+        {
+            foreach (View v in _order.Where (v => v.Visible))
+            {
+                _sideBySideWidth [v] = v.Frame.Width;
+            }
+        }
+
+        bool horizontal = _preferHorizontal && size > SizeClass.Compact && SideBySideWidth () <= available;
+        bool changed = horizontal != _horizontal;
+
+        if (changed)
+        {
+            _horizontal = horizontal;
+
+            foreach (View v in _order)
+            {
+                v.Width = _naturalWidth [v];
+                v.Height = _naturalHeight [v];
+            }
+
+            Width = _horizontal ? _width : Dim.Fill ();
+        }
+
+        // Re-place every time: visibility may have changed even if the direction did not.
+        Arrange ();
+        _measured.Clear ();
+        Equalise (remeasure: true);
+
+        int inner = available - (Frame.Width - Viewport.Width);
+
+        foreach (LayoutView child in _order.OfType<LayoutView> ())
+        {
+            changed |= child.Reflow (size, _horizontal ? child.Frame.Width : inner);
+        }
+
+        return changed;
+    }
+
+    private int SideBySideWidth ()
+    {
+        List<View> shown = _order.Where (v => v.Visible).ToList ();
+
+        return shown.Sum (v => _sideBySideWidth.GetValueOrDefault (v, v.Frame.Width)) + _gap * Math.Max (0, shown.Count - 1);
+    }
+
+    // Chains the visible children one after another; hidden ones are skipped so they leave no gap.
+    private void Arrange ()
+    {
+        View? previous = null;
+
+        foreach (View v in _order.Where (v => v.Visible))
+        {
+            v.X = _horizontal && previous is not null ? Pos.Right (previous) + _gap : 0;
+            v.Y = _horizontal || previous is null ? 0 : Pos.Bottom (previous) + _gap;
+
+            previous = v;
+        }
+    }
+
+    // A row stacked by Reflow fills the width; otherwise the child keeps its own size.
+    private Dim? Natural (View v) =>
+        _horizontal ? _naturalHeight [v]
+        : _preferHorizontal ? Dim.Fill ()
+        : _naturalWidth [v];
 
     private int Axis (View v) => _horizontal ? v.Frame.Height : v.Frame.Width;
 
@@ -108,7 +199,7 @@ internal sealed class LayoutView : View
             return;
         }
 
-        List<View> shown = SubViews.Where (v => _natural.ContainsKey (v) && v.Visible && !v.IsCollapsed ()).ToList ();
+        List<View> shown = SubViews.Where (v => _naturalWidth.ContainsKey (v) && v.Visible && !v.IsCollapsed ()).ToList ();
 
         if (shown.Count == 0)
         {
@@ -125,7 +216,7 @@ internal sealed class LayoutView : View
 
                 foreach (View v in shown)
                 {
-                    reset |= SetAxis (v, _natural [v]);
+                    reset |= SetAxis (v, Natural (v));
                 }
 
                 if (reset)
@@ -140,7 +231,7 @@ internal sealed class LayoutView : View
             }
             else
             {
-                foreach (View v in shown.Where (v => Equals (GetAxis (v), _natural [v])))
+                foreach (View v in shown.Where (v => Equals (GetAxis (v), Natural (v))))
                 {
                     _measured [v] = Axis (v);
                 }
@@ -151,7 +242,7 @@ internal sealed class LayoutView : View
 
             foreach (View v in shown)
             {
-                changed |= SetAxis (v, _measured [v] < largest ? Dim.Fill () : _natural [v]);
+                changed |= SetAxis (v, _measured [v] < largest ? Dim.Fill () : Natural (v));
             }
 
             if (changed)
@@ -165,4 +256,3 @@ internal sealed class LayoutView : View
         }
     }
 }
-

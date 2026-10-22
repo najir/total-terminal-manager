@@ -57,7 +57,7 @@ internal sealed class DashWindow : Window
         ProcessesWidget processes = new ();
         NextUpWidget nextUp = new ();
 
-        View meters = Layouts.Horizontal (system, processes, nextUp);
+        View meters = Layouts.Horizontal (system, processes, nextUp).Responsive (pageTitle: "Meters");
         meters.X = 0;
         meters.Y = 0;
 
@@ -65,7 +65,7 @@ internal sealed class DashWindow : Window
 
         TasksWidget tasks = new (trashable: false);
 
-        View work = Layouts.Horizontal (todo, tasks);
+        View work = Layouts.Horizontal (todo, tasks).Responsive (pageTitle: "Work");
         work.X = 0;
         work.Y = Pos.Bottom (meters);
 
@@ -77,22 +77,24 @@ internal sealed class DashWindow : Window
 
         NotesWidget notes = new ();
 
-        LinksWidget links = new ();
+        // Responsive tags follow the T6 table in docs/responsive-layout-plan.md.
+        LinksWidget links = new LinksWidget ().Responsive (hideBelow: SizeClass.Compact);
 
-        View recent = Layouts.Horizontal (reports, notes, freshdesk, linear, links);
+        View recent = Layouts.Horizontal (reports, notes, freshdesk, linear, links).Responsive (pageTitle: "Recent");
         recent.X = 0;
         recent.Y = Pos.Bottom (work);
 
-        HackerNewsWidget news = new (10);
+        HackerNewsWidget news = new HackerNewsWidget (10).Responsive (hideBelow: SizeClass.Compact);
         SessionsWidget stats = new ();
         MailWidget mail = new ();
         TeamsWidget teams = new ();
 
-        View feeds = Layouts.Horizontal (news, stats, mail, teams);
+        View feeds = Layouts.Horizontal (news, stats, mail, teams).Responsive (pageTitle: "Feeds");
         feeds.X = 0;
         feeds.Y = Pos.Bottom (recent);
 
-        GitContributionsWidget contributions = new ();
+        // The contributions heatmap needs width, so it goes first when space runs out.
+        GitContributionsWidget contributions = new GitContributionsWidget ().Responsive (hideBelow: SizeClass.Compact);
         GitHistoryWidget history = new (amount: GitHistoryWidget.DefaultAmount);
 
         View git = Layouts.Vertical (contributions, history);
@@ -101,17 +103,25 @@ internal sealed class DashWindow : Window
         ReviewHistoryWidget reviews = new ();
         ProjectsWidget projects = new ();
 
-        View lower = Layouts.Horizontal (git, scripts, reviews, projects);
+        View lower = Layouts.Horizontal (git, scripts, reviews, projects).Responsive (pageTitle: "History");
         lower.X = 0;
         lower.Y = Pos.Bottom (feeds);
 
         Add (meters, work, recent, feeds, lower);
 
+        // The wheel scrolls the dashboard, not the tables, lists or other scrolling views inside it.
+        this.NoWheel ();
+
+        // Below 40 columns the rows are shown one at a time (responsive plan T8).
+        ResponsivePager pager = new (this, [meters, work, recent, feeds, lower]);
+
         VerticalScrollBar.VisibilityMode = ScrollBarVisibilityMode.Auto;
 
         void SizeContent ()
         {
-            int needed = Math.Max (Viewport.Height, lower.Frame.Y + lower.Frame.Height);
+            // While paging, only the page on show needs scrolling room.
+            View last = pager.Enabled ? pager.Current : lower;
+            int needed = Math.Max (Viewport.Height, last.Frame.Y + last.Frame.Height);
             System.Drawing.Size wanted = new (Viewport.Width, needed);
 
             if (GetContentSize () != wanted)
@@ -122,6 +132,33 @@ internal sealed class DashWindow : Window
 
         ViewportChanged += (_, _) => SizeContent ();
         SubViewsLaidOut += (_, _) => SizeContent ();
+
+        // Each page starts at its top.
+        pager.PageChanged += () =>
+        {
+            ScrollVertical (-GetContentSize ().Height);
+            SizeContent ();
+        };
+
+        // Stacks, hides and scales the rows as the width changes (responsive plan T5), and pages
+        // them on Tiny (T8).
+        ResponsiveHost.Attach (this, size =>
+        {
+            pager.SetEnabled (size == SizeClass.Tiny);
+
+            // Narrow views have no room for a scroll bar; the wheel and scroll keys still work.
+            if (size <= SizeClass.Compact)
+            {
+                VerticalScrollBar.VisibilityMode = ScrollBarVisibilityMode.Manual;
+                VerticalScrollBar.Visible = false;
+            }
+            else
+            {
+                VerticalScrollBar.VisibilityMode = ScrollBarVisibilityMode.Auto;
+            }
+
+            SizeContent ();
+        });
 
         AddCommand (Command.ScrollDown, () => { ScrollVertical (1); return true; });
         AddCommand (Command.ScrollUp, () => { ScrollVertical (-1); return true; });
@@ -139,8 +176,9 @@ internal sealed class DashWindow : Window
 
         void ApplyToggles ()
         {
-            teams.Visible = UserSettings.On (UserSettings.ShowTeams);
-            mail.Visible = UserSettings.On (UserSettings.ShowMail);
+            // Through ResponsiveVisibility, so a size-based hide never brings back a widget the user switched off.
+            ResponsiveVisibility.SetUserHidden (teams, !UserSettings.On (UserSettings.ShowTeams));
+            ResponsiveVisibility.SetUserHidden (mail, !UserSettings.On (UserSettings.ShowMail));
         }
 
         ApplyToggles ();

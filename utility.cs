@@ -266,6 +266,9 @@ internal static class UserSettings
 
     public const string SyncBranch = "sync-branch";
 
+    // How often the automatic Update runs, in minutes. Zero turns it off.
+    public const string SyncAutoMinutes = "sync-auto-minutes";
+
     // Only consulted for an https remote whose certificate does not chain to a trusted root,
     // which is the normal case for a self-hosted git service.
     public const string SyncInsecureTls = "sync-insecure-tls";
@@ -273,6 +276,17 @@ internal static class UserSettings
     public const string ShowTeams = "show-teams";
 
     public const string ShowMail = "show-mail";
+
+    // Responsive layout (responsive.cs). "auto" picks the tier from the width; any other
+    // value forces that tier.
+    public const string LayoutMode = "layout-mode";
+
+    public const string LayoutAuto = "auto";
+
+    public static readonly string[] LayoutModes = { LayoutAuto, "wide", "medium", "compact", "tiny" };
+
+    // Optional { "tiny": 40, "compact": 80, "medium": 140 } overriding the breakpoint columns.
+    public const string LayoutBreakpoints = "layout-breakpoints";
 
     // "#RRGGBB" chosen on the editor page, or "" for the theme's own Dialog background.
     public const string EditorBackground = "editor-background";
@@ -290,6 +304,8 @@ internal static class UserSettings
 
         [EditorBackground] = "",
 
+        [LayoutMode] = LayoutAuto,
+
         [AiProvider] = ChatProvider.Anthropic,
         [AiUrl] = ChatProvider.AnthropicUrl,
         [AiModel] = "claude-opus-5",
@@ -303,6 +319,7 @@ internal static class UserSettings
 
         [SyncRemote] = "",
         [SyncBranch] = "main",
+        [SyncAutoMinutes] = "5",
         [SyncInsecureTls] = "false",
 
         [FileRoots] = new JsonArray (

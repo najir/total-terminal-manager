@@ -112,8 +112,20 @@ internal static class WheelScrolling
 {
     public const int LinesPerNotch = 4;
 
+    // Views that hand the wheel to their SuperView instead of scrolling (see NoWheel).
+    private static readonly ConditionalWeakTable<View, object> PassingOn = new ();
+
+    public static void PassOn (View view) => PassingOn.AddOrUpdate (view, PassingOn);
+
+    public static bool IsPassingOn (View view) => PassingOn.TryGetValue (view, out _);
+
     public static bool Handle (View view, Mouse mouse)
     {
+        if (PassingOn.TryGetValue (view, out _))
+        {
+            return false;
+        }
+
         if (mouse.Flags.HasFlag (MouseFlags.WheeledDown))
         {
             view.ScrollVertical (LinesPerNotch);
@@ -287,6 +299,39 @@ internal static class ViewCollapse
     }
 }
 
+/// <summary>
+///     Sizes a TableView to its cells while its widget sizes itself to its content, and spans the
+///     widget once the widget is given a width of its own (a stacked responsive row fills it).
+///     Sized to its cells inside a wider widget, a table with vertical cell lines stops one
+///     column short and its right-hand line is never drawn.
+/// </summary>
+internal static class ViewTableWidth
+{
+    private static readonly ConditionalWeakTable<TableView, StrongBox<int>> Cells = new ();
+
+    /// <summary>Sets the width the cells need. Returns true if it differs from the last call.</summary>
+    public static bool FitWidth (this TableView table, int cells)
+    {
+        cells = Math.Max (1, cells);
+
+        if (Cells.TryGetValue (table, out StrongBox<int>? known))
+        {
+            bool changed = known.Value != cells;
+            known.Value = cells;
+
+            return changed;
+        }
+
+        StrongBox<int> box = new (cells);
+        Cells.Add (table, box);
+
+        // Re-evaluated on every layout, so it follows the widget between side by side and stacked.
+        table.Width = Dim.Func (_ => table.SuperView is { Width: not DimAuto } widget ? widget.Viewport.Width : box.Value);
+
+        return true;
+    }
+}
+
 /// <summary>Keeps a TableView from coming up with a row already highlighted.</summary>
 internal static class ViewTableSelection
 {
@@ -390,6 +435,52 @@ internal static class ViewTableWheel
         table.MouseBindings.ReplaceCommands (
             MouseFlags.WheeledUp,
             Enumerable.Repeat (Command.Up, rows).ToArray ());
+    }
+
+    /// <summary>
+    ///     Sends the mouse wheel over any view under <paramref name="root"/> (tables, lists,
+    ///     markdown, scrollable views) to <paramref name="root"/>, so the wheel scrolls the page
+    ///     instead of the view under the pointer. Each view's <see cref="View.MouseEvent"/> is
+    ///     raised before its mouse bindings run, so the wheel is caught there. Removing the bindings
+    ///     is not enough, because a TableView binds the wheel again whenever its source is set.
+    ///     Views added later are covered too. Keyboard scrolling and navigation inside the views
+    ///     are unchanged.
+    /// </summary>
+    public static void NoWheel (this View root)
+    {
+        void Cover (View view)
+        {
+            if (WheelScrolling.IsPassingOn (view))
+            {
+                return;
+            }
+
+            // Views that scroll themselves through WheelScrolling.Handle step aside first.
+            WheelScrolling.PassOn (view);
+
+            view.MouseEvent += (_, mouse) =>
+            {
+                if (mouse.IsWheel)
+                {
+                    WheelScrolling.Handle (root, mouse);
+                    mouse.Handled = true;
+                }
+            };
+
+            view.SubViewAdded += (_, added) => { if (added.SubView is { } child) Cover (child); };
+
+            foreach (View child in view.SubViews)
+            {
+                Cover (child);
+            }
+        }
+
+        root.SubViewAdded += (_, added) => { if (added.SubView is { } child) Cover (child); };
+
+        foreach (View view in root.SubViews)
+        {
+            Cover (view);
+        }
     }
 
     /// <summary>

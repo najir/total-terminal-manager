@@ -45,7 +45,7 @@ dotnet run
 
 | Tab | Source | What it shows | State |
 |---|---|---|---|
-| **Dash** | `mode/dashboard.cs` | Landing page. Rows of widgets: meters (System, Processes, Next Up), work (Todo, Tasks), recent (Reports, Notes, Freshdesk, Linear, Links), feeds (Hacker News, Claude Sessions, Mail, Teams), lower (Git contributions + history, Script history, Review history, Projects). Scrolls vertically. | Usable. Still contains stray test buttons and labels. |
+| **Dash** | `mode/dashboard.cs` | Landing page. Rows of widgets: meters (System, Processes, Next Up), work (Todo, Tasks), recent (Reports, Notes, Freshdesk, Linear, Links), feeds (Hacker News, Claude Sessions, Mail, Teams), lower (Git contributions + history, Script history, Review history, Projects). Scrolls vertically. Responsive: rows stack when the window is narrow, Links, Hacker News and Git contributions hide below 60 columns, most widgets shrink their columns and text at Compact and Tiny, the scroll bar is hidden below 80 columns, and below 60 columns the rows are shown one page at a time (see [docs/responsive-layout-plan.md](docs/responsive-layout-plan.md)). | Usable. Still contains stray test buttons and labels. |
 | **Tasks** | `mode/task.cs` | Task list stored in `tasks.json`. Add, complete, trash. | Usable |
 | **Todos** | `mode/todo.cs` | Scans a root folder for `TODO` markers, lists them, opens the file. | Usable |
 | **Stats** | `mode/claude-stats.cs` | Claude Code usage from `~/.claude/projects` transcripts: totals, 14-day token graph, top 5 tools, per-session table. | Usable |
@@ -70,19 +70,20 @@ dotnet run
 
 | File | Lines | Role |
 |---|---|---|
-| `Program.cs` | 150 | Entry point. Loads `.env`, user settings, opens SQLite, syncs notes, registers themes, builds `MainWindow` (banner + tab bar + all tabs/pages). |
-| `widget.cs` | 4377 | Every reusable widget (see [Widget library](#widget-library)). |
-| `utility.cs` | 2281 | Shared services: `Env`, `GraphAuth`, `GmailAuth`, `UserSettings`, `AutoRefresh`, `ApiCache`, `ChatProvider`, `ContextPolicy`, `RetryingChatClient`, and the AI tool sets (`TerminalTools`, `FileTools`, `MathTools`, `TranscriptTools`). |
-| `ViewHandler.cs` | 416 | View helpers: visibility switching, `Dim.Auto` re-measure, wheel scrolling, `ScrollableView`, collapse toggle, TableView selection/wheel tweaks. |
-| `layouts.cs` | 168 | `Layouts.Horizontal` / `Layouts.Vertical` containers that equalise widgets across the other axis. |
-| `settings.cs` | 447 | Theme, Preferences and User pages plus their menu items. |
+| `Program.cs` | 197 | Entry point. Loads `.env`, user settings, opens SQLite, syncs notes, registers themes, builds `MainWindow` (banner + tab bar + all tabs/pages). The tab bar uses short titles below 80 columns and a single `Menu` item below 60; the banner hides below 80 columns. |
+| `widget.cs` | 5072 | Every reusable widget (see [Widget library](#widget-library)). |
+| `utility.cs` | 2319 | Shared services: `Env`, `GraphAuth`, `GmailAuth`, `UserSettings`, `AutoRefresh`, `ApiCache`, `ChatProvider`, `ContextPolicy`, `RetryingChatClient`, and the AI tool sets (`TerminalTools`, `FileTools`, `MathTools`, `TranscriptTools`). |
+| `ViewHandler.cs` | 507 | View helpers: visibility switching, `Dim.Auto` re-measure, wheel scrolling, `ScrollableView`, collapse toggle, TableView selection/wheel tweaks, `NoWheel` (hand the wheel to the page), `FitWidth` table sizing. |
+| `layouts.cs` | 258 | `Layouts.Horizontal` / `Layouts.Vertical` containers that equalise widgets across the other axis. `Reflow` stacks a horizontal row when space runs out. |
+| `responsive.cs` | 579 | Responsive layout: `SizeClass` tiers, `Breakpoints`, `.Responsive(...)` widget tags, `IResponsive` + `ResponsiveWidth` widget scaling, `TableWrap` wrapped table rows, `ResponsiveVisibility`, the `ResponsiveHost` that re-applies the layout on resize, and the Tiny-tier `ResponsivePager`. |
+| `settings.cs` | 545 | Theme, Preferences and User pages plus their menu items. |
 | `theme.cs` | 175 | Runtime theme JSON (custom themes), apply and restore of the saved theme. |
 | `editorkeys.cs` | 230 | VS Code-style line editing for `Editor` (see [Editor keys](#editor-keys)). |
 | `scripts.cs` | 61 | The Scripts tab window. |
 | `constants.cs` | 23 | `notes` table name and column definitions. |
 | `auth.cs` | 351 | `AuthStore`: credentials encrypted under one passphrase (PBKDF2 -> HKDF -> AES-GCM). No UI dependency. |
 | `authui.cs` | 308 | `AuthPrompt`: the passphrase and credential dialogs. |
-| `datasync.cs` | 780 | `SyncRemote`, `DataSync`, `SyncRunner`: git-backed replication of the app data folder. |
+| `datasync.cs` | 780 | `SyncRemote`, `DataSync`, `SyncRunner`, `AutoSync`: git-backed replication of the app data folder. |
 | `ttm.csproj` | | Project file. Excludes `_archive/**` and `.backup/**` from compilation. |
 | `global.json` | | Pins .NET SDK 10.0.100 with `latestMajor` roll-forward. |
 | `.editorconfig` | | UTF-8, 4-space C#, 2-space JSON/MD/csproj. |
@@ -93,7 +94,7 @@ dotnet run
 
 | File | Lines | Role |
 |---|---|---|
-| `dashboard.cs` | 151 | `DashWindow`: arranges the dashboard widgets in rows. |
+| `dashboard.cs` | 191 | `DashWindow`: arranges the dashboard widgets in rows, tags them for the responsive layout, attaches a `ResponsiveHost` and pages the rows on Tiny. |
 | `task.cs` | 391 | `TaskItem`, `TaskStore` (`tasks.json`), `TasksWidget`, `TasksWindow`. |
 | `tasks.cs` | 1 | **Empty file.** Leftover; safe to ignore. |
 | `todo.cs` | 275 | `TodoTestWindow`: the Todos tab. |
@@ -112,6 +113,8 @@ dotnet run
 ---
 
 ## Widget library (`widget.cs`)
+
+Widgets that implement `IResponsive` (Todo, Next up, System, Processes, Hacker News, Freshdesk, Linear, Mail, Teams) look the same as before at Wide and Medium, and shrink at Compact and Tiny. At Compact and Tiny the Todo, Freshdesk and Linear tables wrap their long column (Text / Title) onto extra rows instead of cutting it (`TableWrap`). Only an item's first row shows its other cells, a blank row separates items, and Enter still opens the right item. The per-widget rules are in [docs/responsive-layout-plan.md](docs/responsive-layout-plan.md) under T7.
 
 | Widget | Used on | Purpose |
 |---|---|---|
@@ -160,7 +163,7 @@ dotnet run
 | `CODEBERG_USER`, `CODEBERG_TOKEN` | Same widgets when `git-provider` = `codeberg` | |
 | `FRESHDESK_DOMAIN`, `FRESHDESK_API_KEY` | `FreshdeskWidget` | |
 | `LINEAR_API_KEY` | `LinearWidget` | Personal API key, sent without a `Bearer` prefix. |
-| `BACKDROP_FILE` / `BACKDROP` | `MainWindow` banner | File wins over inline; inline uses `\n` for line breaks. |
+| `BACKDROP_FILE` / `BACKDROP` | `MainWindow` banner | File wins over inline; inline uses `\n` for line breaks. Hidden below 80 columns. |
 
 Rules: a value already in the real environment wins over `.env`; blank values are ignored.
 
@@ -172,6 +175,8 @@ Rules: a value already in the real environment wins over `.env`; blank values ar
 | `email-provider` | `microsoft` | `microsoft` or `gmail`. |
 | `git-provider` | `github` | `github` or `codeberg`. |
 | `show-teams`, `show-mail` | `true` | Toggle the Teams / Mail widgets on Dash. |
+| `layout-mode` | `auto` | Dash layout tier: `auto` (follows the width), `wide`, `medium`, `compact` or `tiny`. Set from Settings > Preferences > Layout. |
+| `layout-breakpoints` | | Optional object `{ "tiny": 60, "compact": 80, "medium": 140 }` overriding the column thresholds. |
 | `file-roots` | | Folders scanned by the Todo widget and the AI file tools. |
 | `links` | Codeberg, Hacker News | Bookmark table for `LinksWidget`. |
 | `editor-background` | `""` | `#RRGGBB` override for the Notes editor. |
@@ -180,6 +185,7 @@ Rules: a value already in the real environment wins over `.env`; blank values ar
 | `next-up-model` | `""` | Reserved for the Next Up widget. |
 | `sync-remote` | `""` | Data sync remote. `https`/`http` URL, `ssh` URL or scp form, or a local/UNC path. |
 | `sync-branch` | `main` | Branch the sync pushes to and pulls from. |
+| `sync-auto-minutes` | `5` | Push local changes automatically every N minutes. `0` turns it off. Automatic runs never force-push. |
 | `sync-insecure-tls` | `false` | Skip certificate validation for the sync host only. For a self-hosted service with a self-signed certificate. |
 
 ### App data folder (`%APPDATA%\total-manager\`)
@@ -215,6 +221,14 @@ Neither direction merges:
 |---|---|
 | **Download** | The folder is made to match the remote. `fetch` + `reset --hard` + `clean -fd`. Local changes the remote does not have are discarded. |
 | **Update** | The remote is made to match the folder. `add -A` + `commit` + `push --force`. Commits only on the remote are lost. |
+
+**Update can also run automatically.** Set the interval on Settings > User (default **5** minutes;
+`0` turns it off). An automatic run fetches first and skips if the remote has newer commits, and
+its push is not forced - so it can never overwrite work committed by another machine. It uses the
+credential already remembered on this PC and never opens a passphrase prompt; until a manual sync
+has stored one, the Settings page says it is paused. On non-Windows systems the remembered credential
+does not exist, so automatic HTTPS sync stays paused - use an `ssh` or local remote, or press Update
+yourself.
 
 Both confirm first, naming the remote and branch. Download copies the folder to
 `_backup\<timestamp>\` before touching anything.
@@ -317,7 +331,58 @@ Pick under **Settings > Theme**. Button shadows are forced off for performance.
 | `PageUp` / `PageDown` | Page |
 | `Ctrl+Up` / `Ctrl+Down` | One line |
 | `Ctrl+Home` / `Ctrl+End` | Top / bottom |
-| Mouse wheel | Scroll |
+| Mouse wheel | Scroll the whole tab, wherever the pointer is. Tables, lists and other scrolling widgets on Dash pass the wheel to the page (`NoWheel`); use the keyboard to move inside them |
+| `Ctrl+PageUp` / `Ctrl+PageDown`, or click `<` / `>` | Previous / next row page (only below 60 columns, or with Layout = Tiny) |
+
+---
+
+## Making a page responsive
+
+The Dash tab and the tab bar react to the window width. The same pieces in `responsive.cs` can be added to any other page. The full design and history are in [docs/responsive-layout-plan.md](docs/responsive-layout-plan.md).
+
+### Tiers
+
+| Tier | Columns (default) | What happens |
+|---|---|---|
+| `Wide` | 140 and up | The normal look |
+| `Medium` | 80 to 139 | Rows stay side by side if they fit, otherwise they stack |
+| `Compact` | 60 to 79 | Every row stacks; `IResponsive` widgets shrink; Dash hides its scroll bar (wheel and keys still scroll) |
+| `Tiny` | under 60 | Stacked, shrunk to minimum; Dash shows one row at a time and hides its scroll bar (wheel and keys still scroll) |
+
+The thresholds come from the `layout-breakpoints` setting, and `layout-mode` can force a tier (see [User settings](#user-settings-appdatatotal-manageruser-settingsjson)). There are 2 columns of hysteresis, so a resize drag does not flicker on a boundary.
+
+### Steps
+
+1. **Build rows with `Layouts.*`.** `Layouts.Horizontal (a, b, c)` for a row and `Layouts.Vertical` for a column. Only `LayoutView` containers can be restacked (`Reflow`). Views chained by hand with `Pos.Right` cannot.
+2. **Attach a host** in the page's constructor, after its children are added:
+
+   ```csharp
+   ResponsiveHost.Attach (this, size => SizeContent ());
+   ```
+
+   The host listens for width changes, the page being shown and the Layout setting, and waits 50 ms for a resize to settle. It then hides tagged views, scales `IResponsive` widgets, reflows the page's top-level `LayoutView`s and calls the callback. Pass `applyToSubViews: false` when the page only wants the tier, as `MainWindow` does for the tab bar. That stops it touching views that belong to another host.
+3. **Tag views** that should go, or that need a title:
+
+   ```csharp
+   new LinksWidget ().Responsive (hideBelow: SizeClass.Compact);  // hidden on Tiny
+   Layouts.Horizontal (a, b).Responsive (pageTitle: "Work");       // pager header title
+   ```
+
+   `hideBelow` hides the view while the tier is below the given one. A view hidden by the user is never brought back by the host. Route user on/off switches through `ResponsiveVisibility.SetUserHidden (view, hidden)` instead of setting `Visible`. `minWidth` is stored but not used yet.
+4. **Make widgets shrink (optional).** Implement `IResponsive.ApplySize (size, availableWidth)`. `availableWidth` is the inside of the widget's border when it fills the page. Keep the full-size constants for Medium and Wide (`ResponsiveWidth.Scaled (size)` is true only at Compact and Tiny), use `ResponsiveWidth.Fit` / `Cap` for the arithmetic, return early when nothing changed, and redraw through the widget's normal render path. The widgets in `widget.cs` that implement it are examples. Size any `TableView` with `table.FitWidth (cellsWidth)` instead of setting `Width`, so it spans its widget when the row stacks. Otherwise its right-hand edge is cut off.
+5. **Page rows on Tiny (optional).** `new ResponsivePager (this, rows)`, then call `pager.SetEnabled (size == SizeClass.Tiny)` in the host callback. `Ctrl+PageUp` / `Ctrl+PageDown` and the `<` `>` arrows move between rows. While paging, size the scroll content to `pager.Current`.
+
+### Pages not yet responsive
+
+| Page | Source | What blocks it | What it needs |
+|---|---|---|---|
+| Tasks | `mode/task.cs` (`TasksWindow`) | Input toolbar chained with `Pos.Right` (name 30 + description 44 + Add) | Put the toolbar groups in a `Layouts.Horizontal` so they stack, and attach a host |
+| Research | `mode/research.cs` (`ResearchPage`) | Same toolbar pattern: name 30, url 44, category 20, Add, Export | Same as Tasks |
+| Notes editor | `mode/notes.cs` (`EditorPage`) | Button row Open/Save/Save As/Background/Daily chained with `Pos.Right` | Button row as a `Layouts.Horizontal`, or hide the less-used buttons with `hideBelow` |
+| Stats | `mode/claude-stats.cs` | `Dim.Percent (50)` and `Dim.Percent (40)` side-by-side splits (graph + table, sessions + tools) | A reflowing container in place of the percent splits, so the halves stack on Compact |
+| AI | `mode/ai.cs` | Provider/URL/Model/Key fields chained with `Pos.Right` (URL 34, Model 26, Key 24) | Same as Tasks (the tab itself is not reliable; see the warning at the top) |
+| Scripts | `scripts.cs` | Folder toolbar chained with `Pos.Right`, and a `Dim.Percent (30)` script list beside the output | Toolbar row plus a stacking split |
+| Todos | `mode/todo.cs` | Root/rescan toolbar chained with `Pos.Right` | Toolbar row. Its table already shares `TodoTable` with the Dash widget |
 
 ---
 

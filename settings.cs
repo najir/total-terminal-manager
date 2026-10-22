@@ -113,7 +113,25 @@ internal sealed class PreferencesPage : Window
         CheckBox teams = Settings.Toggle ("_Teams", UserSettings.ShowTeams, 0, Pos.Bottom (widgetsLabel));
         CheckBox mail = Settings.Toggle ("_Mail", UserSettings.ShowMail, 0, Pos.Bottom (teams));
 
-        Label aiLabel = new () { Text = "AI default backend", X = 0, Y = Pos.Bottom (mail) + 1 };
+        Label layoutLabel = new () { Text = "Layout", X = 0, Y = Pos.Bottom (mail) + 1 };
+
+        OptionSelector layout = new ()
+        {
+            X = 0,
+            Y = Pos.Bottom (layoutLabel),
+            Labels = UserSettings.LayoutModes,
+            Value = Math.Max (0, Array.IndexOf (UserSettings.LayoutModes, UserSettings.Get (UserSettings.LayoutMode)))
+        };
+
+        layout.ValueChanged += (_, e) =>
+        {
+            if (e.NewValue is { } row && row >= 0 && row < UserSettings.LayoutModes.Length)
+            {
+                Breakpoints.SetMode (UserSettings.LayoutModes [row]);
+            }
+        };
+
+        Label aiLabel = new () { Text = "AI default backend", X = 0, Y = Pos.Bottom (layout) + 1 };
 
         OptionSelector aiProvider = new ()
         {
@@ -261,7 +279,7 @@ internal sealed class PreferencesPage : Window
             Y = Pos.Bottom (urlLabel) + 1
         };
 
-        Add (emailLabel, email, widgetsLabel, teams, mail,
+        Add (emailLabel, email, widgetsLabel, teams, mail, layoutLabel, layout,
              aiLabel, aiProvider, aiUrlLabel, aiUrl, aiModelLabel, aiModel, nextUpLabel, nextUpModelLabel, nextUpModel,
              gitLabel, gitProvider, rootsLabel, rootsValue, editSettings,
              linksLabel, linkList, nameLabel, linkName, urlLabel, linkUrl, addLink, removeLink, path);
@@ -380,8 +398,30 @@ internal sealed class UserPage : Window
         // asked for at all - ssh and a local path never are.
         Label syncKind = new () { X = 0, Y = Pos.Bottom (syncBranchLabel), Width = Dim.Fill (), Height = 1 };
 
-        Button download = new () { Text = "_Download", X = 0, Y = Pos.Bottom (syncKind) };
+        Label autoLabel = new () { Text = "Auto-update every", X = 0, Y = Pos.Bottom (syncKind) };
+
+        TextField autoMinutes = new ()
+        {
+            X = Pos.Right (autoLabel) + 1,
+            Y = Pos.Top (autoLabel),
+            Width = 5,
+            Text = AutoSync.Minutes.ToString ()
+        };
+
+        Label autoUnit = new () { Text = "minutes (0 = off; pushes only)", X = Pos.Right (autoMinutes) + 1, Y = Pos.Top (autoLabel) };
+
+        Label autoStatus = new ()
+        {
+            Text = "  " + AutoSync.Status,
+            X = 0,
+            Y = Pos.Bottom (autoLabel),
+            Width = Dim.Fill (),
+            Height = 1
+        };
+
+        Button download = new () { Text = "_Download", X = 0, Y = Pos.Bottom (autoStatus) };
         Button update = new () { Text = "_Update", X = Pos.Right (download) + 1, Y = Pos.Top (download) };
+        Button review = new () { Text = "_Review", X = Pos.Right (update) + 1, Y = Pos.Top (download) };
 
         // Set by Apply, cleared as soon as the box is edited again.
         string note = "";
@@ -441,6 +481,33 @@ internal sealed class UserPage : Window
 
         syncBranch.TextChanged += (_, _) => UserSettings.Set (UserSettings.SyncBranch, syncBranch.Text.Trim ());
 
+        void SaveAuto ()
+        {
+            string raw = autoMinutes.Text.Trim ();
+
+            if (int.TryParse (raw, out int minutes) && minutes >= 0)
+            {
+                UserSettings.Set (UserSettings.SyncAutoMinutes, minutes.ToString ());
+                AutoSync.Reschedule ();
+            }
+        }
+
+        autoMinutes.TextChanged += (_, _) => SaveAuto ();
+
+        // A blank or negative entry is not committed; put the effective value back on Enter.
+        autoMinutes.Accepted += (_, _) =>
+        {
+            autoMinutes.Text = int.TryParse (autoMinutes.Text.Trim (), out int minutes) && minutes >= 0
+                                   ? minutes.ToString ()
+                                   : AutoSync.Minutes.ToString ();
+        };
+
+        void ShowAutoStatus () => autoStatus.Text = "  " + AutoSync.Status;
+
+        AutoSync.Changed += ShowAutoStatus;
+
+        Disposing += (_, _) => AutoSync.Changed -= ShowAutoStatus;
+
         // Applies first, so what is on screen is always what runs - an unapplied edit can never
         // silently sync the previous remote.
         download.Accepted += (_, _) =>
@@ -453,6 +520,12 @@ internal sealed class UserPage : Window
         {
             Apply ();
             SyncRunner.Update (this);
+        };
+
+        review.Accepted += (_, _) =>
+        {
+            Apply ();
+            SyncRunner.Review (this);
         };
 
         // Separate from the sync group above: the passphrase guards every stored credential, not
@@ -496,6 +569,8 @@ internal sealed class UserPage : Window
                                             $"Delete all {stored} stored credential(s)?"
                                             + Environment.NewLine
                                             + Environment.NewLine
+                                            + "Includes the copies remembered for this Windows account."
+                                            + Environment.NewLine
                                             + "The passphrase is kept. You will be asked for each token"
                                             + Environment.NewLine
                                             + "again the next time it is needed."
@@ -521,7 +596,9 @@ internal sealed class UserPage : Window
         };
 
         Add (syncLabel, syncRemoteLabel, syncRemote, apply,
-             syncBranchLabel, syncBranch, insecure, syncKind, download, update,
+             syncBranchLabel, syncBranch, insecure, syncKind,
+             autoLabel, autoMinutes, autoUnit, autoStatus,
+             download, update, review,
              credentialsLabel, credentialsValue, passphrase, forget, path);
     }
 }
